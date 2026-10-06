@@ -149,6 +149,24 @@ def _warn_internal(problem, outcome="reported as degraded, reason null"):
         detail = "%s: %s" % (detail, message)
     _warn("error: probe.py unexpected failure: %s (%s)" % (detail, outcome))
 
+def _warn_supplement_failed(source, problem):
+    """One stderr line for ANY failure of a supplement, whatever the cause (§4.3 v2.2).
+
+    A supplement is consulted exactly when the primary source had nothing to show, so
+    its failure always lands on the one envelope that also means "genuinely nothing" —
+    `ok` + `results: []`. stdout cannot carry the difference (`reason` is reserved for a
+    failure of the whole operation) and the `sources` entry alone is easy to miss, so
+    stderr is the channel that keeps an empty answer from being read as an authoritative
+    "nothing exists" — the Testrim case HN exists for. An InternalError keeps its own
+    diagnostic, where the exception type is the actionable part.
+    """
+    if isinstance(problem, InternalError):
+        _warn_internal(problem, "%s failed; the envelope stays ok" % source)
+        return
+    _warn("error: %s supplement failed (%s); the empty result is not evidence of "
+          "absence, and sources marks %s as failed"
+          % (source, _degraded_reason(problem), source))
+
 def _with_retry(fn, attempts=2, backoff=RETRY_BACKOFF):
     """Call fn(); on a rate limit sleep `backoff` and try again, then re-raise.
 
@@ -224,11 +242,15 @@ def normalize_repo(item):
     }
 
 def _per_page(limit):
-    """Clamp limit for programmatic callers: GitHub accepts per_page 1..100 only.
+    """Clamp limit for programmatic callers: both sources take 1..100 (or nothing).
 
-    Measured: per_page=0 and per_page=101 both return HTTP 200 with the value
-    silently normalised (per_page=0 came back with MORE items than requested), so
-    an out-of-range value must never reach the API.
+    GitHub accepts per_page 1..100 only. Measured: per_page=0 and per_page=101 both
+    return HTTP 200 with the value silently normalised (per_page=0 came back with MORE
+    items than requested), so an out-of-range value must never reach the API. HN reuses
+    the same bound for `hitsPerPage`: an out-of-range value is rejected rather than
+    normalised, and a rejected request is a failed HN search caused by nothing but the
+    number we sent — the CLI is already bounded at 1..100, this covers callers of
+    `hn_search()`/`search_envelope()`.
     """
     return max(1, min(100, int(limit)))
 
@@ -311,7 +333,7 @@ def _hn_url(terms, limit):
     natural-language concepts while GitHub only indexes repo descriptions.
     """
     return (HN_ENDPOINT + "?query=" + urllib.parse.quote(" ".join(terms))
-            + "&tags=story&hitsPerPage=%d" % limit)
+            + "&tags=story&hitsPerPage=%d" % _per_page(limit))
 
 def _hn_entry(hit):
     """One Algolia hit -> a `discussion` entry (§4.3).
@@ -533,9 +555,9 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
                         "status": "ok"}
             hn_results = hn["results"]
         except Exception as exc:    # noqa: BLE001 - a supplement failure is partial
-            problem = _classify(exc)
-            if isinstance(problem, InternalError):
-                _warn_internal(problem, "hn failed; the envelope stays ok")
+            # stdout keeps the ruled shape (ok / reason null), so the failure has to be
+            # spoken on stderr or an empty answer reads as "nothing exists" (§4.3 v2.2).
+            _warn_supplement_failed("hn", _classify(exc))
             sources.append({"source": "hn", "status": "failed"})
         else:
             sources.append(hn_entry)

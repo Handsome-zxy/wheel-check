@@ -762,6 +762,20 @@ class TestHnNormalization(unittest.TestCase):
         self.assertEqual(params["hitsPerPage"], ["5"])
         self.assertNotIn("apiKey", seen[0], "the Algolia endpoint is keyless")
 
+    def test_programmatic_hn_limit_is_clamped_like_github(self):
+        # hitsPerPage has an upper bound Algolia rejects, and a rejected request is a
+        # failed HN search caused by nothing but an out-of-range number. --limit is
+        # bounded 1..100 by argparse; this is the programmatic path the brief mandates.
+        p = load_probe()
+        for limit, expected in ((5000, "100"), (0, "1"), (8, "8")):
+            seen = []
+            def fetch(url, **kw):
+                seen.append(url)
+                return FAKE_HN
+            p.hn_search(["x"], limit, fetch=fetch)
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(seen[0]).query)
+            self.assertEqual(params["hitsPerPage"], [expected], "limit=%r" % (limit,))
+
     def test_created_at_without_a_timestamp_is_empty_not_a_crash(self):
         p = load_probe()
         item = p.hn_search(["x"], 5,
@@ -804,6 +818,16 @@ class TestHnSourceDispatch(unittest.TestCase):
         self.assertEqual(env["sources"],
                          [{"source": "hn", "tier": "plain", "total": 42, "status": "ok"}])
         self.assertEqual(len(env["results"]), 1)
+
+    def test_hn_total_falls_back_to_the_hit_count_without_nbhits(self):
+        # The only payload without `nbHits` so far went through hn_search(), which throws
+        # `total` away — leaving the source entry's count unpinned in that case. A body
+        # with no match count must still report the hits it did return, never None or 0.
+        p = load_probe()
+        payload = {"hits": FAKE_HN["hits"] * 2}          # no nbHits key at all
+        env = p.search_envelope(["x"], source="hn", fetch=lambda url, **kw: payload)[1]
+        self.assertEqual(env["sources"][0]["total"], 2)
+        self.assertEqual(len(env["results"]), 2)
 
     def test_explicit_hn_failure_degrades_because_hn_was_the_whole_operation(self):
         p = load_probe()
@@ -885,6 +909,27 @@ class TestHnSourceDispatch(unittest.TestCase):
         self.assertEqual(env["sources"][1],
                          {"source": "hn", "tier": "plain", "total": 1, "status": "ok"})
 
+    def test_hn_gets_no_retry_once_github_spent_the_budget(self):
+        # RETRY_BUDGET is ONE retry for the whole search: a 429 on GitHub's first tier
+        # spends it, so HN's own 429 must fail the supplement on its first attempt
+        # instead of buying a second.
+        p = load_probe()
+        calls = {"github": 0, "hn": 0}
+        def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                calls["hn"] += 1
+                raise p.RateLimited("429")
+            calls["github"] += 1
+            if calls["github"] == 1:
+                raise p.RateLimited("429")
+            return {"total_count": 0, "items": []}
+        with unittest.mock.patch.object(p.time, "sleep", lambda seconds: None):
+            code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
+        self.assertEqual(code, p.EXIT_OK)
+        self.assertEqual(calls["github"], 4)      # 429 + its retry + relaxed + plain
+        self.assertEqual(calls["hn"], 1, "the search's single retry was already spent")
+        self.assertEqual(env["sources"][1], {"source": "hn", "status": "failed"})
+
     def test_an_internal_error_in_hn_reaches_stderr(self):
         # A malformed HN body is a probe.py-side surprise, not a network condition; the
         # envelope keeps its partial-failure shape but the bug must still be diagnosable.
@@ -899,6 +944,31 @@ class TestHnSourceDispatch(unittest.TestCase):
         self.assertEqual((code, env["status"], env["reason"]), (p.EXIT_OK, "ok", None))
         self.assertEqual(env["sources"][1], {"source": "hn", "status": "failed"})
         self.assertIn("AttributeError", err.getvalue())
+
+    def test_a_supplement_failure_always_reaches_stderr(self):
+        # §4.3 (v2.2): a supplement failure leaves the envelope `ok` + `results: []` — the
+        # very shape that also means "genuinely nothing". stdout cannot carry the
+        # difference and `reason` is reserved for the whole operation, so stderr is the
+        # only channel left; silence there lets a caller skip a precedent that does exist
+        # (exactly the Testrim case HN was added for). Every classified reason speaks.
+        p = load_probe()
+        cases = ((p.NetworkError("proxy refused"), "network"),
+                 (p.Timeout("boom"), "timeout"),
+                 (p.RateLimited("429"), "rate-limited"))
+        for problem, reason in cases:
+            def fetch(url, **kw):
+                if "hn.algolia.com" in url:
+                    raise problem
+                return {"total_count": 0, "items": []}
+            err = io.StringIO()
+            with unittest.mock.patch.object(p.time, "sleep", lambda seconds: None), \
+                    contextlib.redirect_stderr(err):
+                code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
+            self.assertEqual(code, p.EXIT_OK, reason)
+            self.assertEqual(env["sources"][1],
+                             {"source": "hn", "status": "failed"}, reason)
+            self.assertIn("hn", err.getvalue(), reason)
+            self.assertIn(reason, err.getvalue(), reason)
 
 class TestMainHnSource(unittest.TestCase):
     """§10.1 evals run `--source hn`: the flag must really reach Algolia, not GitHub."""
