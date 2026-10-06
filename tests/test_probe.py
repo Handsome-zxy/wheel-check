@@ -1243,6 +1243,21 @@ class _Resp(io.BytesIO):
     def __exit__(self, *exc):
         return False
 
+def health_fetch(rate_limit=None, hn=None, hf=None):
+    """Per-leg bodies for health tests: each URL gets a body shaped like its own source.
+
+    `health` certifies liveness per source, so one body for all three legs is not a valid
+    stub any more: the HN leg must see an Algolia object and the HF leg a bare array, or
+    the report correctly refuses to certify them.
+    """
+    def fetch(url, **kw):
+        if "api.github.com" in url:
+            return FAKE_RATE_LIMIT if rate_limit is None else rate_limit
+        if "hn.algolia.com" in url:
+            return FAKE_HN if hn is None else hn
+        return FAKE_HF if hf is None else hf
+    return fetch
+
 class TestHuggingFaceGate(unittest.TestCase):
     """§5.5 + Review Focus #5: HF is a CONDITIONAL source, decided by is_ai_requirement."""
 
@@ -1346,6 +1361,15 @@ class TestHuggingFaceNormalization(unittest.TestCase):
     def test_an_empty_hub_answer_is_an_empty_list(self):
         p = load_probe()
         self.assertEqual(p.hf_search(["x"], 5, fetch=lambda url, **kw: []), [])
+
+    def test_programmatic_limit_is_clamped_like_the_other_sources(self):
+        # GitHub and HN both route through _per_page; the Hub is the third source, so an
+        # out-of-range limit must not reach it either (search_envelope(..., limit=500)).
+        p = load_probe()
+        seen = []
+        p.hf_search(["x"], 5000, fetch=lambda url, **kw: seen.append(url) or [])
+        self.assertIn("limit=100", seen[0])
+        self.assertNotIn("5000", seen[0])
 
 class TestHuggingFaceSourceDispatch(unittest.TestCase):
     """§5.5 / Review Focus #5: `auto` gates on the AI check, `--source hf` is forced."""
@@ -1556,11 +1580,44 @@ class TestRepoCommand(unittest.TestCase):
 
     def test_extra_slashes_or_an_empty_half_are_bad_args_too(self):
         p = load_probe()
-        for bad in ("a/b/c", "/name", "owner/", ""):
-            code, out, err = self._run(p, ["repo", bad])
-            self.assertEqual(code, 3, bad)
-            self.assertEqual(out, "", bad)
-            self.assertIn("error", err, bad)
+        def boom(req, timeout=None):
+            # If valid_full_name() ever accepted these, the call would reach api.github.com
+            # and the regression would surface as a degraded exit 2 instead of a bad call.
+            raise AssertionError("a malformed full_name must not query anything")
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", boom):
+            for bad in ("a/b/c", "/name", "owner/", "", "own er/name"):
+                code, out, err = self._run(p, ["repo", bad])
+                self.assertEqual(code, 3, bad)
+                self.assertEqual(out, "", bad)
+                self.assertIn("error", err, bad)
+
+    def test_a_200_that_is_not_a_repository_degrades_instead_of_inventing_one(self):
+        # §4.1 forbids inventing stars/dates, and normalize_repo maps every absent field to
+        # None by design: feeding it a non-repository body would ship an `ok` envelope whose
+        # kind:"repo" entry is null in every field, and the caller would render those nulls
+        # as facts. The body shape is checked first, so it degrades with a diagnostic.
+        p = load_probe()
+        for payload in ({}, {"message": "Not Found"}, {"items": []}):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code, env = p.repo_envelope("o/n", fetch=lambda url, **kw: payload)
+            self.assertEqual(code, p.EXIT_DEGRADED, payload)
+            self.assertEqual(env["status"], "degraded", payload)
+            self.assertEqual(env["results"], [], payload)
+            self.assertNotEqual((env["status"], env["results"]), ("ok", []), payload)
+            self.assertIsNone(env["reason"], payload)
+            self.assertIn("full_name", err.getvalue(), payload)
+
+    def test_the_cli_reports_an_unreadable_200_as_degraded_not_as_a_repository(self):
+        p = load_probe()
+        def urlopen(req, timeout=None):
+            return _Resp(json.dumps({}).encode("utf-8"))
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen):
+            code, out, err = self._run(p, ["repo", "Tinder/bazel-diff"])
+        self.assertEqual(code, 2)
+        env = json.loads(out)
+        self.assertEqual((env["status"], env["results"]), ("degraded", []))
+        self.assertIn("full_name", err)
 
     def test_a_failed_lookup_degrades_and_explains_itself_on_stderr(self):
         p = load_probe()
@@ -1597,7 +1654,7 @@ class TestHealthReport(unittest.TestCase):
 
     def test_all_legs_reachable_reports_ok_with_the_github_search_quota(self):
         p = load_probe()
-        code, rep = p.health_report(fetch=lambda url, **kw: FAKE_RATE_LIMIT)
+        code, rep = p.health_report(fetch=health_fetch())
         self.assertEqual(code, p.EXIT_OK)
         self.assertEqual(rep["status"], "ok")
         self.assertIsNone(rep["reason"])
@@ -1611,11 +1668,37 @@ class TestHealthReport(unittest.TestCase):
                          {"search": {"limit": 10, "remaining": 9, "reset": 1770000000},
                           "core": {"limit": 60, "remaining": 42, "reset": 1770000000}})
 
+    def test_health_does_not_certify_a_leg_whose_body_it_cannot_use(self):
+        # A 200 is not liveness: `{}` for the Hub leaves hf_search raising and a body without
+        # `hits` leaves Algolia unreadable, so certifying either `ok` would send the caller
+        # to a leg that cannot serve a single request.
+        p = load_probe()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, rep = p.health_report(fetch=health_fetch(hn={}, hf={}))
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(rep["status"], "degraded")
+        self.assertEqual([s["source"] for s in rep["sources"]], ["github", "hn", "hf"])
+        self.assertEqual([s["status"] for s in rep["sources"]],
+                         ["ok", "failed", "failed"])
+        self.assertEqual([s.get("reason") for s in rep["sources"]][1:], [None, None])
+        self.assertEqual(rep["sources"][0]["status"], "ok",
+                         "the healthy leg keeps its quota facts")
+        self.assertIn("hits", err.getvalue())
+        self.assertIn("list", err.getvalue())
+
+    def test_health_accepts_the_body_shapes_the_retrievers_consume(self):
+        p = load_probe()
+        code, rep = p.health_report(fetch=health_fetch(hn=FAKE_HN, hf=FAKE_HF))
+        self.assertEqual(code, p.EXIT_OK)
+        self.assertEqual([s["status"] for s in rep["sources"]], ["ok", "ok", "ok"])
+        self.assertEqual(rep["sources"][1], {"source": "hn", "status": "ok"})
+
     def test_a_token_raised_quota_is_reported_as_authenticated(self):
         p = load_probe()
         body = {"resources": {"search": {"limit": 30, "remaining": 29, "reset": 1},
                               "core": {"limit": 5000, "remaining": 4999, "reset": 1}}}
-        rep = p.health_report(fetch=lambda url, **kw: body)[1]
+        rep = p.health_report(fetch=health_fetch(rate_limit=body))[1]
         self.assertEqual(rep["sources"][0]["auth"], "token")
         self.assertEqual(rep["sources"][0]["quota"]["search"]["limit"], 30)
 
@@ -1624,7 +1707,7 @@ class TestHealthReport(unittest.TestCase):
         def fetch(url, **kw):
             if "hn.algolia.com" in url:
                 raise urllib.error.URLError("no route to host")
-            return FAKE_RATE_LIMIT
+            return FAKE_RATE_LIMIT if "api.github.com" in url else FAKE_HF
         code, rep = p.health_report(fetch=fetch)
         self.assertEqual(code, p.EXIT_DEGRADED)
         self.assertEqual(rep["status"], "degraded")
@@ -1640,7 +1723,7 @@ class TestHealthReport(unittest.TestCase):
         p = load_probe()
         body = {"resources": {"search": {"limit": 10, "remaining": 0, "reset": 1770000000},
                               "core": {"limit": 60, "remaining": 60, "reset": 1}}}
-        code, rep = p.health_report(fetch=lambda url, **kw: body)
+        code, rep = p.health_report(fetch=health_fetch(rate_limit=body))
         self.assertEqual((code, rep["status"], rep["reason"]),
                          (p.EXIT_DEGRADED, "degraded", "rate-limited"))
         self.assertEqual(rep["sources"][0]["status"], "ok", "the API did answer")
@@ -1652,7 +1735,7 @@ class TestHealthReport(unittest.TestCase):
         p = load_probe()
         body = {"resources": {"search": {"limit": 10, "remaining": 10, "reset": 1},
                               "core": {"limit": 60, "remaining": 0, "reset": 1791296439}}}
-        code, rep = p.health_report(fetch=lambda url, **kw: body)
+        code, rep = p.health_report(fetch=health_fetch(rate_limit=body))
         self.assertEqual((code, rep["status"], rep["reason"]), (p.EXIT_OK, "ok", None))
         self.assertEqual(rep["sources"][0]["quota"]["core"]["remaining"], 0,
                          "the spent bucket is a reported fact, not a hidden one")
@@ -1660,7 +1743,11 @@ class TestHealthReport(unittest.TestCase):
     def test_health_never_spends_the_search_quota(self):
         p = load_probe()
         seen = []
-        p.health_report(fetch=lambda url, **kw: seen.append(url) or FAKE_RATE_LIMIT)
+        fetch = health_fetch()
+        def recording(url, **kw):
+            seen.append(url)
+            return fetch(url, **kw)
+        p.health_report(fetch=recording)
         self.assertEqual(len(seen), 3, "three legs, one request each")
         self.assertIn("api.github.com/rate_limit", seen[0])
         self.assertFalse(any("/search/repositories" in u for u in seen),
@@ -1672,7 +1759,7 @@ class TestHealthReport(unittest.TestCase):
         p = load_probe()
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            code, rep = p.health_report(fetch=lambda url, **kw: {"resources": {}})
+            code, rep = p.health_report(fetch=health_fetch(rate_limit={"resources": {}}))
         self.assertEqual(code, p.EXIT_DEGRADED)
         self.assertEqual(rep["sources"][0]["status"], "failed")
         self.assertIsNone(rep["sources"][0]["reason"])
@@ -1685,7 +1772,7 @@ class TestHealthReport(unittest.TestCase):
         body = {"resources": {"search": {"limit": 10, "remaining": 9, "reset": 1}}}
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            code, rep = p.health_report(fetch=lambda url, **kw: body)
+            code, rep = p.health_report(fetch=health_fetch(rate_limit=body))
         self.assertEqual(code, p.EXIT_DEGRADED)
         self.assertEqual(rep["sources"][0]["status"], "failed")
         self.assertIn("resources.core", err.getvalue())
@@ -1693,7 +1780,12 @@ class TestHealthReport(unittest.TestCase):
     def test_health_prints_the_report_on_stdout_and_exits_0_on_a_live_wire(self):
         p = load_probe()
         def urlopen(req, timeout=None):
-            body = FAKE_RATE_LIMIT if "api.github.com" in req.full_url else {}
+            if "api.github.com" in req.full_url:
+                body = FAKE_RATE_LIMIT
+            elif "hn.algolia.com" in req.full_url:
+                body = FAKE_HN
+            else:
+                body = FAKE_HF
             return _Resp(json.dumps(body).encode("utf-8"))
         out, err = io.StringIO(), io.StringIO()
         with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
@@ -1908,6 +2000,66 @@ class TestMalformedLegPayloads(unittest.TestCase):
         self.assertEqual((code, env["status"]), (p.EXIT_OK, "ok"))
         self.assertEqual(env["sources"][-1], {"source": "hf", "status": "failed"})
         self.assertIn("TypeError", err.getvalue())
+
+    def test_a_non_list_results_field_degrades_instead_of_crashing(self):
+        # Gap 2's second half: moving the reads inside the try does not stop `results` from
+        # being a non-list, which poisons the append below (`list + str` -> uncaught
+        # TypeError, exit 1) or ships a non-array `results` in a single-source envelope.
+        p = load_probe()
+        p._source_legs = lambda: {"github": self._malformed(
+            {"tier": "plain", "total": 1, "results": "oops"})}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="github", fetch=lambda url, **kw: {})
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(env["status"], "degraded")
+        self.assertEqual(env["results"], [])
+        self.assertIn("non-list results", err.getvalue())
+
+    def test_a_single_source_can_never_ship_a_non_array_results(self):
+        p = load_probe()
+        p._source_legs = lambda: {"hf": self._malformed(
+            {"tier": "plain", "total": 1, "results": "oops"})}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["speech to text"], source="hf",
+                                          fetch=lambda url, **kw: {})
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(env["results"], [])
+        self.assertIsInstance(env["results"], list)
+
+    def test_a_non_list_results_field_in_the_hf_append_is_a_partial_failure(self):
+        # The exact escape the reviewer reproduced: the append sits in the `else:` clause of
+        # the HF block, so a `"results": "oops"` payload used to raise out of search_envelope.
+        p = load_probe()
+        legs = p._source_legs()
+        legs["hf"] = self._malformed({"tier": "plain", "total": 1, "results": "oops"})
+        p._source_legs = lambda: legs
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["local speech to text"], source="auto",
+                                          fetch=lambda url, **kw: {"total_count": 1,
+                                                                   "items": [FAKE_REPO]})
+        self.assertEqual((code, env["status"]), (p.EXIT_OK, "ok"))
+        self.assertEqual([r["kind"] for r in env["results"]], ["repo"],
+                         "github's answer survives a malformed model leg")
+        self.assertEqual(env["sources"][-1], {"source": "hf", "status": "failed"})
+        self.assertIn("non-list results", err.getvalue())
+
+    def test_a_non_list_results_field_in_the_hn_append_is_a_partial_failure(self):
+        p = load_probe()
+        legs = p._source_legs()
+        legs["hn"] = self._malformed({"tier": "plain", "total": 1, "results": "oops"})
+        p._source_legs = lambda: legs
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="auto",
+                                          fetch=lambda url, **kw: {"total_count": 0,
+                                                                   "items": []})
+        self.assertEqual((code, env["status"]), (p.EXIT_OK, "ok"))
+        self.assertEqual(env["sources"][-1], {"source": "hn", "status": "failed"})
+        self.assertEqual(env["results"], [])
+        self.assertIn("non-list results", err.getvalue())
 
 class TestRejectedHttpStatusIsNotATransportFailure(unittest.TestCase):
     """A delivered-and-rejected 4xx is not a transport condition (controller ruling).

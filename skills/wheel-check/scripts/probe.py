@@ -311,15 +311,35 @@ def github_search(terms, limit, fetch=urlopen_json, strict_only=False):
 
 GITHUB_API = "https://api.github.com"
 
+def _repo_page(data):
+    """Read one /repos/{owner}/{repo} body, or refuse to read it as a repository.
+
+    `normalize_repo` maps every absent field to `None` by design — right for a real payload,
+    catastrophic for a body that is not a repository at all: `{}` or `{"message": ...}`
+    would become an `ok` envelope holding a `kind: "repo"` entry with every fact null, and
+    §4.1 forbids the caller ever rendering those nulls as facts (绝不编造 star / 日期). This
+    is the same defect class `_github_page` closes on the search path, applied to the
+    single-repo path the reviewer reproduced.
+
+    A repository response is recognisable by `full_name`. Without a non-empty one the body
+    is not a repository, so the lookup degrades with a diagnostic instead of inventing one.
+    """
+    if (not isinstance(data, dict) or not isinstance(data.get("full_name"), str)
+            or not data["full_name"].strip()):
+        raise InternalError(ValueError(
+            "not a GitHub repository response (expected full_name): %r" % (data,)))
+    return data
+
 def repo_detail(full_name, fetch=urlopen_json):
     """Hard facts for ONE repository (`kind: "repo"`), §4.2's `repo <owner/name>`.
 
     §4.3 forces the caller to backfill an HN hit: a discussion entry carries a title and
     a link and nothing else, and HN's points must never stand in for repository maturity.
     This is the lookup that replaces that guess with a fact, through the same
-    `normalize_repo` the search path uses so both shapes stay identical.
+    `normalize_repo` the search path uses so both shapes stay identical — and through
+    `_repo_page` first, so a 200 that is not a repository never becomes a null-filled fact.
     """
-    return normalize_repo(fetch(GITHUB_API + "/repos/" + full_name))
+    return normalize_repo(_repo_page(fetch(GITHUB_API + "/repos/" + full_name)))
 
 HN_ENDPOINT = "https://hn.algolia.com/api/v1/search"
 HN_ITEM = "https://news.ycombinator.com/item?id=%s"
@@ -401,10 +421,13 @@ def _hf_url(terms, limit):
     """The Hub's keyless model search, most-downloaded first (§2.2b).
 
     `sort=downloads&direction=-1` is what makes the answer usable: the Hub has no stars
-    and no license, and its relevance order puts 4-download toys at the top.
+    and no license, and its relevance order puts 4-download toys at the top. `limit` goes
+    through the same `_per_page` clamp as GitHub and HN: out-of-range values are only
+    reachable programmatically today, and one source silently accepting what the other two
+    refuse is how a bound stops being a bound.
     """
     return (HF_ENDPOINT + "?search=" + urllib.parse.quote(" ".join(terms))
-            + "&limit=%d&sort=downloads&direction=-1" % limit)
+            + "&limit=%d&sort=downloads&direction=-1" % _per_page(limit))
 
 def _hf_entry(model):
     """One Hub model -> a `model` entry (§4.3): model_id / downloads / likes / url only.
@@ -422,6 +445,17 @@ def _hf_entry(model):
             "likes": model.get("likes"),
             "url": (HF_MODEL % model_id) if model_id else None}
 
+def _hf_models(body):
+    """The Hub body `hf_search` consumes: a bare array of models, and nothing else.
+
+    One shape check shared by the retriever and by `health`'s liveness reading, so the two
+    cannot disagree about what "the Hub answered" means.
+    """
+    if not isinstance(body, list):
+        raise InternalError(ValueError(
+            "Hugging Face model search did not return a list: %r" % (body,)))
+    return body
+
 def hf_search(terms, limit, fetch=urlopen_json):
     """Model entries for `terms`, most-downloaded first (Task 6 interface).
 
@@ -430,19 +464,19 @@ def hf_search(terms, limit, fetch=urlopen_json):
     asked and had nothing" and "the Hub's answer was unreadable" must never collapse into
     the same envelope, because the first one is allowed to mean "nothing exists".
     """
-    data = fetch(_hf_url(terms, limit))
-    if not isinstance(data, list):
-        raise InternalError(ValueError(
-            "Hugging Face model search did not return a list: %r" % (data,)))
-    return [_hf_entry(m) for m in data]
+    return [_hf_entry(m) for m in _hf_models(fetch(_hf_url(terms, limit)))]
 
 def _hf_leg(terms, limit, fetch=urlopen_json, strict_only=False):
     """`hf_search` in the leg shape the source dispatch expects: {"tier","total","results"}.
 
     The Hub has no filter ladder, so the tier is always `plain` (§4.3's HN precedent) and
-    `--strict` — a GitHub filter concept — is deliberately ignored. `total` is the count
-    the Hub actually returned: this endpoint answers with a bare array and no match count,
-    so there is no `total_count` to report and inventing one would be a made-up number.
+    `--strict` — a GitHub filter concept — is deliberately ignored.
+
+    `total` IS `len(results)`, and that is the one place it differs from GitHub's
+    `total_count` and Algolia's `nbHits`: this endpoint answers with a bare array and
+    exposes no match count at all, so there is no honest source-side number to pass through
+    and inventing one would be a made-up figure. A caller must therefore read an `hf`
+    entry's `total` as "the Hub returned N models" — never as "the Hub has exactly N".
     """
     results = hf_search(terms, limit, fetch)
     return {"tier": "plain", "total": len(results), "results": results}
@@ -457,6 +491,25 @@ def _source_legs():
     `{"tier", "total", "results"}` payload.
     """
     return {"github": github_search, "hn": _hn_leg, "hf": _hf_leg}
+
+def _leg_payload(source, found):
+    """Validate one leg's payload and return its (source_entry, results).
+
+    A leg is an outside shape: `github_search`, `_hn_leg`, `_hf_leg`, a test double, or a
+    source added later. Reading `found["tier"]`/`["total"]`/`["results"]` inside the try
+    was Gap 2's first half; this is the second, because those reads still let a non-list
+    `results` through. That poisons the append below (`list + str` raises a TypeError no
+    `except` covers, so `main()` exits 1 with a traceback) or ships a non-array `results`
+    in a single-source envelope. Both violate §4.3, so the payload is checked before use
+    and a bad one degrades loudly instead.
+    """
+    entry = {"source": source, "tier": found["tier"], "total": found["total"],
+             "status": "ok"}
+    results = found["results"]
+    if not isinstance(results, list):
+        raise InternalError(ValueError(
+            "%s leg carried a non-list results field: %r" % (source, results)))
+    return entry, results
 
 def _degraded_reason(problem):
     """Map a classified failure onto the §4.3 `reason` vocabulary.
@@ -497,9 +550,12 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
     network or a bug returns `degraded` with an empty `results` — never `ok` + `[]`,
     which would make the skill silently skip a precedent that does exist.
 
-    `terms` is the CLEANED list from validate_terms(); `total` in each source entry
-    is the API's `total_count`, not `len(results)` — the two legitimately disagree
-    because `per_page` caps the returned array (measured: total 5260, 8 returned).
+    `terms` is the CLEANED list from validate_terms(); `total` in a source entry is the
+    source's OWN match count — GitHub's `total_count`, Algolia's `nbHits` — which may
+    exceed `len(results)` because the page size caps the array (measured: total 5260, 8
+    returned). The Hub is the documented exception: its models endpoint exposes no match
+    count at all, so an `hf` entry's `total` IS the number of models returned and must be
+    read as "the Hub returned N", never as "the Hub has exactly N" (see `_hf_leg`).
 
     `source` selects which legs run. `auto` is the §5.5 strategy: GitHub first, and HN
     only when GitHub came back EMPTY (a hit, however noisy, is the caller's to judge —
@@ -525,12 +581,11 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
     retrying = _retrying_fetch(fetch)
     try:
         found = leg(terms, limit, fetch=retrying, strict_only=strict_only)
-        # Read the leg's payload INSIDE the protected region: a leg is an outside shape
-        # (github_search, _hn_leg, _hf_leg, a test double), and a shape bug in any of them
-        # must degrade with a diagnostic instead of escaping main() as a traceback.
-        entry = {"source": wanted, "tier": found["tier"], "total": found["total"],
-                 "status": "ok"}
-        results = found["results"]
+        # Read and validate the leg's payload INSIDE the protected region: a leg is an
+        # outside shape (github_search, _hn_leg, _hf_leg, a test double), and a shape bug in
+        # any of them must degrade with a diagnostic instead of escaping main() as a
+        # traceback — including a non-list `results`, which `_leg_payload` refuses.
+        entry, results = _leg_payload(wanted, found)
     except Exception as exc:        # noqa: BLE001 - any retrieval failure degrades
         # Classify whatever came out of the retrieval: transport failures become
         # rate-limited / network / timeout, anything else is an InternalError that is
@@ -551,9 +606,7 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
         try:
             hn = _source_legs()["hn"](terms, limit, fetch=retrying,
                                       strict_only=strict_only)
-            hn_entry = {"source": "hn", "tier": hn["tier"], "total": hn["total"],
-                        "status": "ok"}
-            hn_results = hn["results"]
+            hn_entry, hn_results = _leg_payload("hn", hn)
         except Exception as exc:    # noqa: BLE001 - a supplement failure is partial
             # stdout keeps the ruled shape (ok / reason null), so the failure has to be
             # spoken on stderr or an empty answer reads as "nothing exists" (§4.3 v2.2).
@@ -571,9 +624,7 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
         try:
             hf = _source_legs()["hf"](terms, limit, fetch=retrying,
                                       strict_only=strict_only)
-            hf_entry = {"source": "hf", "tier": hf["tier"], "total": hf["total"],
-                        "status": "ok"}
-            hf_results = hf["results"]
+            hf_entry, hf_results = _leg_payload("hf", hf)
         except Exception as exc:    # noqa: BLE001 - a supplement failure is partial
             problem = _classify(exc)
             if isinstance(problem, InternalError):
@@ -621,19 +672,39 @@ def github_quota(body):
                          "reset": facts.get("reset")}
     return quota
 
+def _hn_page(body):
+    """The Algolia body `_hn_hits` consumes: an object carrying a `hits` list."""
+    if not isinstance(body, dict) or not isinstance(body.get("hits"), list):
+        raise InternalError(ValueError(
+            "not an Algolia story response (expected hits): %r" % (body,)))
+    return body
+
+# source -> the shape check that decides whether that leg answered with something usable.
+# `github` is handled separately below because its check also yields the quota facts.
+HEALTH_SHAPES = {"hn": _hn_page, "hf": _hf_models}
+
 def _health_entry(name, url, fetch):
-    """One source's liveness entry; a failure is classified, never raised (§4.3 vocab)."""
+    """One source's liveness entry; a failure is classified, never raised (§4.3 vocab).
+
+    Liveness means "this source answered with a body the retriever can actually use", not
+    merely "a 200 arrived": `{}` from the Hub leaves `hf_search` raising, and a body without
+    `hits` leaves Algolia unreadable, so certifying either `ok` would send the caller to a
+    leg that cannot serve a single request. The checks are the same ones the retrievers use,
+    so health and search cannot disagree about what "answered" means.
+    """
     try:
         body = fetch(url)
-        entry = {"source": name, "status": "ok"}
         if name == "github":
-            entry["quota"] = github_quota(body)
-            # The API's own limit IS the observed auth state (10 anonymous, 30 with a
-            # token); labelling it from GITHUB_TOKEN would describe what the environment
-            # claims rather than what this process actually sent on the wire.
-            entry["auth"] = ("token"
-                             if entry["quota"]["search"]["limit"] > GITHUB_ANON_SEARCH_LIMIT
-                             else "anonymous")
+            quota = github_quota(body)
+            entry = {"source": name, "status": "ok", "quota": quota,
+                     # The API's own limit IS the observed auth state (10 anonymous, 30
+                     # with a token); labelling it from GITHUB_TOKEN would describe what
+                     # the environment claims rather than what this process sent.
+                     "auth": ("token" if quota["search"]["limit"] > GITHUB_ANON_SEARCH_LIMIT
+                              else "anonymous")}
+        else:
+            HEALTH_SHAPES[name](body)
+            entry = {"source": name, "status": "ok"}
     except Exception as exc:        # noqa: BLE001 - health reports, it never raises
         problem = _classify(exc)
         if isinstance(problem, InternalError):
