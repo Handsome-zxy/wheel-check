@@ -3,6 +3,8 @@
 import argparse
 import json
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, timedelta
@@ -10,6 +12,9 @@ from datetime import date, timedelta
 EXIT_OK = 0
 EXIT_DEGRADED = 2
 EXIT_BAD_ARGS = 3
+
+RETRY_BACKOFF = 1.0   # seconds between the original request and its one retry (§6)
+RETRY_BUDGET = 1      # retries allowed for a WHOLE search: 3 tier requests + 1 retry
 
 UA = {"User-Agent": "wheel-check", "Accept": "application/vnd.github+json"}
 
@@ -44,6 +49,68 @@ def urlopen_json(url, headers=None, timeout=15):
     req = urllib.request.Request(url, headers=headers or UA)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
+
+class RateLimited(Exception):
+    """403/429: the GitHub quota is exhausted (unauthenticated: 10 requests/minute)."""
+
+class Timeout(Exception):
+    """Any other failure that stopped the request: timeout, 5xx, DNS, bad body."""
+
+def _classify(exc):
+    """Map a fetch failure onto the two degraded reasons the envelope can carry.
+
+    Our own exception types pass straight through: an injected `fetch` (tests, future
+    sources) raises RateLimited/Timeout directly, and re-classifying those would turn
+    a quota error into a generic Timeout and silently lose the retry.
+    """
+    if isinstance(exc, (RateLimited, Timeout)):
+        return exc
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code in (403, 429):
+            return RateLimited(str(exc.code))
+        return Timeout("http-%s" % exc.code)
+    return Timeout(type(exc).__name__)
+
+def _with_retry(fn, attempts=2, backoff=RETRY_BACKOFF):
+    """Call fn(); on a rate limit sleep `backoff` and try again, then re-raise.
+
+    Only quota errors are worth retrying — a 5xx or a dead socket is raised as-is
+    after being classified. `attempts=2` means the original request plus one retry.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:          # noqa: BLE001 - classify, then re-raise
+            last = _classify(e)
+            if isinstance(last, RateLimited) and i + 1 < attempts:
+                time.sleep(backoff)
+                continue
+            raise last
+    raise last
+
+def _retrying_fetch(fetch, backoff=RETRY_BACKOFF):
+    """Wrap `fetch` with the 403/429 retry, charged to the search as a whole.
+
+    The retry belongs to the REQUEST, not to the tier loop: `github_search` spends one
+    request per tier, and a persistent 403 has to cost exactly two requests (original
+    + retry) and then raise, so the loop never advances into relaxed/plain against an
+    API that is already refusing. Retrying per call instead would let one search cost
+    up to six requests; one retry for the whole search keeps the ceiling at three tier
+    requests + one retry = four (plan budget: <=3 searches, <=45s).
+    """
+    budget = {"retries": RETRY_BUDGET}
+    def wrapped(url, **kw):
+        made = []
+        def call():
+            made.append(1)
+            return fetch(url, **kw)
+        try:
+            return _with_retry(call, attempts=1 + budget["retries"], backoff=backoff)
+        finally:
+            if len(made) > 1:           # a retry was really spent, charge it
+                budget["retries"] -= 1
+    return wrapped
 
 def build_query(terms, suffix):
     """Plain space-joined concept nouns (GitHub ANDs them) plus the tier suffix.
@@ -106,6 +173,47 @@ def github_search(terms, limit, fetch=urlopen_json, strict_only=False):
                     "results": [normalize_repo(i) for i in items]}
     return {"tier": "none", "total": 0, "results": []}
 
+def _degraded(reason):
+    """Whole-operation failure. `reason` is reserved for this, never per-source.
+
+    Per-source trouble (Task 5+) sets that entry's `status`; only a failure that
+    stops the operation as a whole may set the envelope's `reason`.
+    """
+    return {"status": "degraded", "reason": reason,
+            "sources": [{"source": "github", "status": "degraded"}],
+            "results": []}
+
+def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_only=False):
+    """Run the source legs; return (exit_code, envelope) in the §4.3 shape.
+
+    `status: "ok"` with `results: []` is the ONLY "there is genuinely nothing"
+    signal. Every other combination has to be spoken aloud, so a rate limit or a
+    dead network returns `degraded` with an empty `results` — never `ok` + `[]`,
+    which would make the skill silently skip a precedent that does exist.
+
+    `terms` is the CLEANED list from validate_terms(); `total` in each source entry
+    is the API's `total_count`, not `len(results)` — the two legitimately disagree
+    because `per_page` caps the returned array (measured: total 5260, 8 returned).
+
+    `source` selects which legs run. Tasks 5/6 add the HN and HuggingFace legs;
+    until then only GitHub is wired, so `auto` means GitHub-only.
+    """
+    retrying = _retrying_fetch(fetch)
+    try:
+        gh = github_search(terms, limit, fetch=retrying, strict_only=strict_only)
+    except Exception as exc:        # noqa: BLE001 - any retrieval failure degrades
+        # Classify whatever came out of the retrieval: our own types pass through,
+        # everything else (5xx, dead socket, unreadable body) becomes `timeout`. A
+        # body we could not read must degrade — reporting it as `ok` + `[]` would be
+        # the one lie this contract forbids.
+        problem = _classify(exc)
+        return EXIT_DEGRADED, _degraded(
+            "rate-limited" if isinstance(problem, RateLimited) else "timeout")
+    return EXIT_OK, {"status": "ok", "reason": None,
+                     "sources": [{"source": "github", "tier": gh["tier"],
+                                  "total": gh["total"], "status": "ok"}],
+                     "results": gh["results"]}
+
 class _ArgParser(argparse.ArgumentParser):
     """ArgumentParser whose usage errors exit with EXIT_BAD_ARGS, not argparse's 2.
 
@@ -155,8 +263,14 @@ def main(argv=None):
             print("error: %s" % e, file=sys.stderr)
             return EXIT_BAD_ARGS
         # Hand the search path the CLEANED list: raw `--terms " a |  | b | "` must
-        # never reach build_query with empty groups or surrounding whitespace.
+        # never reach build_query with empty groups or surrounding whitespace. Never
+        # validate_terms(args.terms) a second time — it splits on "|" and would raise
+        # AttributeError on the list it is handed.
         args.terms = terms
+        code, env = search_envelope(args.terms, source=args.source, limit=args.limit,
+                                    strict_only=args.strict)
+        print(json.dumps(env, ensure_ascii=False))
+        return code
     return EXIT_OK
 
 if __name__ == "__main__":
