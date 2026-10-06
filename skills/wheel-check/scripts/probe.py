@@ -60,6 +60,18 @@ class Timeout(Exception):
 class NetworkError(Exception):
     """The request never got through: DNS, refused/reset connection, proxy, no route."""
 
+class InternalError(Exception):
+    """An unexpected failure: a probe.py bug, or a response shape we cannot read.
+
+    Kept apart from the transport failures on purpose. The envelope must not offer a
+    network-shaped `reason` for a bug — it reports `degraded` with `reason: null` and
+    puts the real exception type on stderr (see `_warn_internal`).
+    """
+
+    def __init__(self, cause):
+        Exception.__init__(self, "%s: %s" % (type(cause).__name__, cause))
+        self.cause = cause
+
 def _is_timeout(exc):
     """True for a genuine timeout, in either the 3.8 or the 3.10+ spelling."""
     return isinstance(exc, (socket.timeout, TimeoutError))
@@ -72,11 +84,15 @@ def _classify(exc):
     different remedies, so telling the user "timeout" when DNS never resolved would
     point them at the wrong fix.
 
+    Anything we cannot recognise as a transport failure becomes InternalError rather
+    than being relabelled as `timeout`: a bug must not be reported as a network
+    condition (the controller's ruling on fix round 2).
+
     Our own exception types pass straight through: an injected `fetch` (tests, future
     sources) raises them directly, and re-classifying those would turn a quota error
     into a generic Timeout and silently lose the retry.
     """
-    if isinstance(exc, (RateLimited, Timeout, NetworkError)):
+    if isinstance(exc, (RateLimited, Timeout, NetworkError, InternalError)):
         return exc
     if isinstance(exc, urllib.error.HTTPError):     # also a URLError: check first
         if exc.code in (403, 429):
@@ -93,7 +109,22 @@ def _classify(exc):
         return Timeout(type(exc).__name__)
     if isinstance(exc, OSError):                    # bare socket/SSL failure
         return NetworkError(type(exc).__name__)
-    return Timeout(type(exc).__name__)              # no other reason exists in §4.3
+    return InternalError(exc)                       # not a transport failure at all
+
+def _warn_internal(problem):
+    """Report an unexpected failure on stderr; stdout stays pure JSON (§4.3).
+
+    Without this line a bug inside probe.py would reach the caller as an unexplained
+    `degraded` and nobody would ever notice it. The global constraint sends error text
+    to stderr, which is exactly what this is.
+    """
+    cause = problem.cause
+    message = str(cause)
+    detail = type(cause).__name__
+    if message and len(message) <= 200:             # long tracebacks are unreadable
+        detail = "%s: %s" % (detail, message)
+    print("error: probe.py unexpected failure: %s (reported as degraded, reason null)"
+          % detail, file=sys.stderr)
 
 def _with_retry(fn, attempts=2, backoff=RETRY_BACKOFF):
     """Call fn(); on a rate limit sleep `backoff` and try again, then re-raise.
@@ -197,53 +228,85 @@ def github_search(terms, limit, fetch=urlopen_json, strict_only=False):
                     "results": [normalize_repo(i) for i in items]}
     return {"tier": "none", "total": 0, "results": []}
 
+def _source_legs():
+    """source name -> retriever, or None when this build has no retriever for it.
+
+    Task 5 replaces the "hn" None with its retriever and Task 6 does "hf"; this is the
+    one place a source is registered, so the honest-degradation path below stops
+    firing for a source the moment its retriever exists.
+    """
+    return {"github": github_search, "hn": None, "hf": None}
+
 def _degraded_reason(problem):
-    """Map a classified failure onto the §4.3 `reason` vocabulary."""
+    """Map a classified failure onto the §4.3 `reason` vocabulary.
+
+    Returns None when §4.3 cannot name the cause (an InternalError, or a source this
+    build has no retriever for). The envelope still says `degraded` — it just does not
+    invent a cause; the real one is on stderr. Claiming `timeout` for a probe.py bug
+    would report a false cause to the user.
+    """
     for exc_type, reason in ((RateLimited, "rate-limited"),
                              (NetworkError, "network"),
                              (Timeout, "timeout")):
         if isinstance(problem, exc_type):
             return reason
-    return "timeout"        # _classify only ever returns the three above
+    return None
 
-def _degraded(reason):
+def _degraded(reason, source="github"):
     """Whole-operation failure. `reason` is reserved for this, never per-source.
 
     Per-source trouble (Task 5+) sets that entry's `status`; only a failure that
-    stops the operation as a whole may set the envelope's `reason`.
+    stops the operation as a whole may set the envelope's `reason`. `source` names the
+    leg that failed, so a degraded envelope never blames a source the caller did not
+    ask for.
     """
     return {"status": "degraded", "reason": reason,
-            "sources": [{"source": "github", "status": "degraded"}],
+            "sources": [{"source": source, "status": "degraded"}],
             "results": []}
 
 def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_only=False):
     """Run the source legs; return (exit_code, envelope) in the §4.3 shape.
 
     `status: "ok"` with `results: []` is the ONLY "there is genuinely nothing"
-    signal. Every other combination has to be spoken aloud, so a rate limit or a
-    dead network returns `degraded` with an empty `results` — never `ok` + `[]`,
+    signal. Every other combination has to be spoken aloud, so a rate limit, a dead
+    network or a bug returns `degraded` with an empty `results` — never `ok` + `[]`,
     which would make the skill silently skip a precedent that does exist.
 
     `terms` is the CLEANED list from validate_terms(); `total` in each source entry
     is the API's `total_count`, not `len(results)` — the two legitimately disagree
     because `per_page` caps the returned array (measured: total 5260, 8 returned).
 
-    `source` selects which legs run. Tasks 5/6 add the HN and HuggingFace legs;
-    until then only GitHub is wired, so `auto` means GitHub-only.
+    `source` selects which legs run (`auto` = the default set, today GitHub only).
+    A source with no retriever in this build is a whole-operation degradation, never a
+    silent answer with another source's data; see `_source_legs`.
+
+    `reason` is None when the cause is outside §4.3's vocabulary (internal error,
+    unimplemented source): the envelope is still `degraded`, and stderr carries the
+    real exception type. stdout is always pure JSON.
     """
+    wanted = "github" if source == "auto" else source
+    leg = _source_legs().get(wanted)
+    if leg is None:
+        print("error: --source %s has no retriever in this build; no query was sent "
+              "and GitHub was NOT queried in its place" % wanted, file=sys.stderr)
+        return EXIT_DEGRADED, _degraded(None, source=wanted)
     retrying = _retrying_fetch(fetch)
     try:
-        gh = github_search(terms, limit, fetch=retrying, strict_only=strict_only)
+        found = leg(terms, limit, fetch=retrying, strict_only=strict_only)
     except Exception as exc:        # noqa: BLE001 - any retrieval failure degrades
-        # Classify whatever came out of the retrieval: our own types pass through,
-        # everything else (5xx, dead socket, unreadable body) becomes `timeout` or
-        # `network`. A body we could not read must degrade — reporting it as `ok` +
-        # `[]` would be the one lie this contract forbids.
-        return EXIT_DEGRADED, _degraded(_degraded_reason(_classify(exc)))
+        # Classify whatever came out of the retrieval: transport failures become
+        # rate-limited / network / timeout, anything else is an InternalError that is
+        # reported as-is on stderr rather than relabelled. Degrading is mandatory here
+        # — reporting a failure as `ok` + `[]` would be the one lie this contract
+        # forbids.
+        problem = _classify(exc)
+        if isinstance(problem, InternalError):
+            _warn_internal(problem)
+        return EXIT_DEGRADED, _degraded(_degraded_reason(problem), source=wanted)
     return EXIT_OK, {"status": "ok", "reason": None,
-                     "sources": [{"source": "github", "tier": gh["tier"],
-                                  "total": gh["total"], "status": "ok"}],
-                     "results": gh["results"]}
+                     "sources": [{"source": wanted, "tier": found["tier"],
+                                  "total": found["total"], "status": "ok"}],
+                     "results": found["results"]}
 
 class _ArgParser(argparse.ArgumentParser):
     """ArgumentParser whose usage errors exit with EXIT_BAD_ARGS, not argparse's 2.

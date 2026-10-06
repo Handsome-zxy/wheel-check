@@ -590,10 +590,101 @@ class TestFetchFailureClassification(unittest.TestCase):
         code, env = p.search_envelope(["x"], source="github", fetch=fetch)
         self.assertEqual((code, env["reason"]), (p.EXIT_DEGRADED, "network"))
 
-    def test_a_malformed_body_degrades_instead_of_crashing(self):
+class TestInternalFailure(unittest.TestCase):
+    """A bug inside probe.py must degrade loudly, not masquerade as a network condition.
+
+    `{"items": [None]}` raises AttributeError inside normalize_repo. The envelope has
+    to say `degraded` (never the forbidden `ok` + []), must NOT claim a cause it does
+    not have, and the real exception type has to reach stderr — stdout is reserved for
+    the JSON contract, and a silent wrong label is exactly what this project forbids.
+    """
+
+    def _run(self, p, fetch):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="github", fetch=fetch)
+        return code, env, err.getvalue()
+
+    def _payload(self, payload):
+        return lambda url, **kw: payload
+
+    def test_items_containing_none_is_degraded_and_never_ok_empty(self):
         p = load_probe()
-        code, env = p.search_envelope(["x"], source="github", fetch=lambda url, **kw: None)
+        code, env, _ = self._run(p, self._payload({"total_count": 1, "items": [None]}))
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(env["status"], "degraded")
+        self.assertNotEqual((env["status"], env["results"]), ("ok", []),
+                            "a crash must never look like a genuine empty search")
+        self.assertEqual(env["results"], [])
+
+    def test_an_internal_failure_claims_no_cause(self):
+        p = load_probe()
+        _, env, _ = self._run(p, self._payload({"total_count": 1, "items": [None]}))
+        self.assertIsNone(env["reason"],
+                          "an internal bug must not be reported as timeout/network")
+
+    def test_the_real_exception_type_reaches_stderr(self):
+        p = load_probe()
+        _, _, err = self._run(p, self._payload({"total_count": 1, "items": [None]}))
+        self.assertIn("AttributeError", err)
+        self.assertIn("unexpected", err)
+
+    def test_a_non_dict_body_is_degraded_and_reported(self):
+        p = load_probe()
+        code, env, err = self._run(p, self._payload(None))
         self.assertEqual((code, env["status"], env["results"]), (p.EXIT_DEGRADED, "degraded", []))
+        self.assertIsNone(env["reason"])
+        self.assertIn("AttributeError", err)
+
+    def test_a_long_exception_message_is_truncated_on_stderr(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            raise RuntimeError("x" * 5000)
+        code, env, err = self._run(p, fetch)
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertIn("RuntimeError", err)
+        self.assertLess(len(err), 400, "the diagnostic must stay one readable line")
+
+class TestSourceDispatch(unittest.TestCase):
+    """An explicit --source must never be answered with a different source's data.
+
+    Silently returning GitHub repos for `--source hn` is how an eval records the wrong
+    source's data as the source's result. Until a retriever exists, asking for it
+    degrades the whole operation (exit 2) with the reason on stderr.
+    """
+
+    def _unimplemented(self, p):
+        source = "hf"           # Task 6 registers it; "hn" was covered the same way
+        if p._source_legs().get(source) is not None:
+            self.skipTest("%s now has a retriever" % source)
+        return source
+
+    def test_a_source_without_a_retriever_degrades_instead_of_answering_with_github(self):
+        p = load_probe()
+        source = self._unimplemented(p)
+        calls = []
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source=source,
+                                          fetch=lambda url, **kw: calls.append(url))
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(env["status"], "degraded")
+        self.assertEqual(env["results"], [])
+        self.assertEqual(calls, [], "--source %s must not be answered with GitHub data" % source)
+        self.assertEqual(env["sources"], [{"source": source, "status": "degraded"}])
+        self.assertIn(source, err.getvalue())
+
+    def test_auto_and_explicit_github_still_query_github(self):
+        p = load_probe()
+        for source in ("auto", "github"):
+            calls = []
+            def fetch(url, **kw):
+                calls.append(url)
+                return {"total_count": 1, "items": [FAKE_REPO]}
+            code, env = p.search_envelope(["x"], source=source, fetch=fetch)
+            self.assertEqual(code, p.EXIT_OK, source)
+            self.assertEqual(len(calls), 1, source)
+            self.assertEqual(env["sources"][0]["source"], "github", source)
 
 class TestSearchEnvelope(unittest.TestCase):
     """Spec 4.3: status / reason / sources / results are all required, always."""
@@ -706,6 +797,21 @@ class TestMainSearchOutput(unittest.TestCase):
         self.assertEqual(seen, {}, "a malformed call must not become a degraded retrieval")
         self.assertEqual(out.getvalue(), "")
 
+    def test_cli_source_without_a_retriever_exits_2_and_never_calls_the_wire(self):
+        p = load_probe()
+        source = "hf"
+        if p._source_legs().get(source) is not None:
+            self.skipTest("%s now has a retriever" % source)
+        def boom(req, timeout=None):
+            raise AssertionError("a source with no retriever must not query anything")
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", boom), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = p.main(["search", "--terms", "x", "--source", source])
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(json.loads(out.getvalue())["status"], "degraded")
+        self.assertIn(source, err.getvalue())
+
 class TestMainEndToEnd(unittest.TestCase):
     """main() is the composition root: every failure path must RETURN an exit code.
 
@@ -768,6 +874,18 @@ class TestMainEndToEnd(unittest.TestCase):
         code, out, _ = self._run(urlopen)
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(out)["status"], "degraded")
+
+    def test_an_internal_failure_stays_off_stdout_and_reports_on_stderr(self):
+        # stdout must remain parseable JSON for the model; the diagnosis goes to stderr.
+        def urlopen(req, timeout=None):
+            body = json.dumps({"total_count": 1, "items": [None]}).encode("utf-8")
+            return self._Resp(body)
+        code, out, err = self._run(urlopen)
+        self.assertEqual(code, 2)
+        env = json.loads(out)
+        self.assertEqual(env["status"], "degraded")
+        self.assertEqual(env["results"], [])
+        self.assertIn("AttributeError", err)
 
 class TestEnvelopeOutputEncoding(unittest.TestCase):
     """Review Focus #3: the envelope is printed with ensure_ascii=False, so a GBK
