@@ -1477,7 +1477,9 @@ class TestRepoCommand(unittest.TestCase):
 
     def test_a_failed_lookup_degrades_and_explains_itself_on_stderr(self):
         p = load_probe()
+        calls = []
         def urlopen(req, timeout=None):
+            calls.append(req.full_url)
             raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
         with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen):
             code, out, err = self._run(p, ["repo", "Tinder/bazel-diff"])
@@ -1487,7 +1489,10 @@ class TestRepoCommand(unittest.TestCase):
         self.assertEqual(env["results"], [])
         self.assertNotEqual((env["status"], env["results"]), ("ok", []),
                             "a failed lookup must never look like a repository with no facts")
+        self.assertIsNone(env["reason"],
+                          "a 404 was delivered and rejected: it is not a timeout (§4.3)")
         self.assertIn("404", err, "the raw HTTP status is the diagnosable fact")
+        self.assertEqual(len(calls), 1, "a rejected status is not a quota error: no retry")
 
     def test_repo_detail_uses_the_repos_endpoint_verbatim(self):
         p = load_probe()
@@ -1816,6 +1821,65 @@ class TestMalformedLegPayloads(unittest.TestCase):
         self.assertEqual((code, env["status"]), (p.EXIT_OK, "ok"))
         self.assertEqual(env["sources"][-1], {"source": "hf", "status": "failed"})
         self.assertIn("TypeError", err.getvalue())
+
+class TestRejectedHttpStatusIsNotATransportFailure(unittest.TestCase):
+    """A delivered-and-rejected 4xx is not a transport condition (controller ruling).
+
+    §6 hands `timeout` / `network` / `rate-limited` different remedies, so a 404 from a typo
+    must not borrow `timeout`: sending the user to check their network when the real answer
+    is "that repository does not exist" points at the wrong fix. Such a status is an
+    internal/unexpected condition — degraded with `reason: null` — while 403/429 stay
+    `rate-limited` and 5xx keeps `timeout` (a 504 genuinely is one).
+    """
+
+    def _http_error(self, code):
+        return urllib.error.HTTPError("https://api.github.com/repos/o/n", code,
+                                      "boom", {}, None)
+
+    def test_404_is_an_internal_condition_and_claims_no_reason(self):
+        p = load_probe()
+        problem = p._classify(self._http_error(404))
+        self.assertIsInstance(problem, p.InternalError)
+        self.assertIsNone(p._degraded_reason(problem),
+                          "a rejected request is not a cause §4.3 can name")
+
+    def test_400_is_an_internal_condition_and_claims_no_reason(self):
+        p = load_probe()
+        problem = p._classify(self._http_error(400))
+        self.assertIsInstance(problem, p.InternalError)
+        self.assertIsNone(p._degraded_reason(problem))
+
+    def test_403_and_429_keep_their_rate_limited_label(self):
+        p = load_probe()
+        for code in (403, 429):
+            self.assertIsInstance(p._classify(self._http_error(code)), p.RateLimited, code)
+
+    def test_5xx_keeps_its_timeout_label(self):
+        p = load_probe()
+        for code in (500, 503, 504):
+            self.assertIsInstance(p._classify(self._http_error(code)), p.Timeout, code)
+
+    def test_a_search_404_degrades_with_a_null_reason_and_the_status_on_stderr(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            raise self._http_error(404)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="github", fetch=fetch)
+        self.assertEqual((code, env["status"], env["reason"], env["results"]),
+                         (p.EXIT_DEGRADED, "degraded", None, []))
+        self.assertIn("404", err.getvalue())
+
+    def test_a_rejected_status_is_not_retried(self):
+        # Only 403/429 are quota errors worth a retry; a rejection is final.
+        p = load_probe()
+        calls = []
+        def fetch(url, **kw):
+            calls.append(url)
+            raise self._http_error(400)
+        with unittest.mock.patch.object(p.time, "sleep", lambda seconds: None):
+            p.search_envelope(["x"], source="github", fetch=fetch)
+        self.assertEqual(len(calls), 1)
 
 if __name__ == "__main__":
     unittest.main()

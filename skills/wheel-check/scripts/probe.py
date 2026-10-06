@@ -84,6 +84,12 @@ def _classify(exc):
     different remedies, so telling the user "timeout" when DNS never resolved would
     point them at the wrong fix.
 
+    A 4xx that is not 403/429 (404, 400, 422 …) is neither: the request WAS delivered and
+    the server rejected it, so calling it `timeout` would send the caller to check a
+    network that is working (controller ruling). It becomes an InternalError — an
+    unexpected condition with no §4.3 name — and the raw status travels in the cause for
+    the caller's diagnostic. 5xx keeps `timeout`: a 504 genuinely is one.
+
     Anything we cannot recognise as a transport failure becomes InternalError rather
     than being relabelled as `timeout`: a bug must not be reported as a network
     condition (the controller's ruling on fix round 2).
@@ -97,6 +103,8 @@ def _classify(exc):
     if isinstance(exc, urllib.error.HTTPError):     # also a URLError: check first
         if exc.code in (403, 429):
             return RateLimited(str(exc.code))
+        if 400 <= exc.code < 500:
+            return InternalError(exc)               # delivered and rejected, not transport
         return Timeout("http-%s" % exc.code)
     if isinstance(exc, urllib.error.URLError):
         # urlopen wraps socket-level failures in URLError. A wrapped socket.timeout
@@ -431,10 +439,14 @@ def _source_legs():
 def _degraded_reason(problem):
     """Map a classified failure onto the §4.3 `reason` vocabulary.
 
-    Returns None when §4.3 cannot name the cause (an InternalError, or a source this
-    build has no retriever for). The envelope still says `degraded` — it just does not
-    invent a cause; the real one is on stderr. Claiming `timeout` for a probe.py bug
-    would report a false cause to the user.
+    THE RULE for `reason`: it names a cause the CALLER CAN ACT ON — `rate-limited` (wait
+    for the window, or set GITHUB_TOKEN), `network` (fix connectivity, or fall back to
+    L2/L3), `timeout` (retry later) — and it is `null` when the cause is internal,
+    unexpected, or an unimplemented source. A `null` reason never means "nothing was
+    wrong": the envelope is still `degraded` and stderr carries the real cause
+    (`_warn_internal`). Naming a cause that does not exist, such as `timeout` for a
+    probe.py bug or for an HTTP status the server delivered and rejected, would send the
+    caller after a remedy that cannot work.
     """
     for exc_type, reason in ((RateLimited, "rate-limited"),
                              (NetworkError, "network"),
@@ -657,12 +669,19 @@ def repo_envelope(full_name, fetch=urlopen_json):
         entry = repo_detail(full_name, fetch=_retrying_fetch(fetch))
     except Exception as exc:        # noqa: BLE001 - any lookup failure degrades
         problem = _classify(exc)
-        if isinstance(problem, InternalError):
+        if isinstance(problem, InternalError) and isinstance(problem.cause,
+                                                            urllib.error.HTTPError):
+            # A 4xx that is not a quota error: a typo'd name (404) or a bad lookup (400)
+            # was delivered and rejected. §4.3 has no word for it, so the envelope reports
+            # `degraded` with `reason: null` and this line is the whole diagnosis — the raw
+            # status, which is exactly what the caller has to see.
+            _warn("error: repo lookup failed for %s: HTTP %s"
+                  % (full_name, problem.cause.code))
+        elif isinstance(problem, InternalError):
             _warn_internal(problem)
         else:
-            # §4.3's reason vocabulary has no word for a 404, so the classified detail —
-            # which does name the raw status — is the diagnosis the caller needs (§6).
-            # stdout keeps its shape; the explanation goes where error text belongs.
+            # A transport failure does have a §4.3 name (it is in the envelope); the detail
+            # is echoed here so the `repo` call is diagnosable on its own.
             _warn("error: repo lookup failed for %s: %s" % (full_name, problem))
         return EXIT_DEGRADED, _degraded(_degraded_reason(problem), source="github")
     return EXIT_OK, {"status": "ok", "reason": None,
