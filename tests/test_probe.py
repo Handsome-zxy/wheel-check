@@ -686,6 +686,250 @@ class TestSourceDispatch(unittest.TestCase):
             self.assertEqual(len(calls), 1, source)
             self.assertEqual(env["sources"][0]["source"], "github", source)
 
+FAKE_HN = {"nbHits": 1, "hits": [{
+    "title": "Show HN: Testrim – Intelligent Test Impact Analysis",
+    "objectID": "47382910", "points": 42, "created_at": "2026-03-11T10:00:00Z",
+    "url": "https://github.com/example/testrim",
+}]}
+
+class TestHackerNews(unittest.TestCase):
+    def test_hn_item_is_normalized_as_discussion(self):
+        p = load_probe()
+        out = p.hn_search(["incremental test selection"], 5, fetch=lambda url, **kw: FAKE_HN)
+        self.assertEqual(len(out), 1)
+        item = out[0]
+        self.assertEqual(item["kind"], "discussion")
+        self.assertEqual(item["points"], 42)
+        self.assertEqual(item["created_at"], "2026-03-11")
+        self.assertEqual(item["url"], "https://news.ycombinator.com/item?id=47382910")
+        self.assertEqual(item["external_url"], "https://github.com/example/testrim")
+        self.assertNotIn("stars", item)          # HN 不提供硬事实
+        self.assertNotIn("license", item)
+
+    def test_hn_used_when_github_is_empty(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                return FAKE_HN
+            return {"total_count": 0, "items": []}
+        code, env = p.search_envelope(["incremental test selection"], source="auto", fetch=fetch)
+        self.assertEqual(code, 0)
+        self.assertEqual(env["status"], "ok")
+        self.assertEqual([r["kind"] for r in env["results"]], ["discussion"])
+
+    def test_hn_not_called_when_github_has_hits(self):
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            if "hn.algolia.com" in url:
+                return FAKE_HN
+            return {"total_count": 1, "items": [FAKE_REPO]}
+        p.search_envelope(["test selection"], source="auto", fetch=fetch)
+        self.assertFalse(any("hn.algolia.com" in u for u in seen))
+
+class TestHnNormalization(unittest.TestCase):
+    """§4.3: a discussion entry carries ONLY what HN can supply.
+
+    HN has titles, points, a creation date, the item URL and the external link. It has
+    no stars, no license and no archived flag, so a discussion entry must never borrow
+    a repo-shaped field — that would present HN's popularity as repository maturity
+    (§9, controller ruling).
+    """
+
+    def test_discussion_entry_has_exactly_the_hn_field_set(self):
+        p = load_probe()
+        item = p.hn_search(["x"], 5, fetch=lambda url, **kw: FAKE_HN)[0]
+        self.assertEqual(sorted(item),
+                         ["created_at", "external_url", "kind", "points", "title", "url"])
+        for repo_field in ("stars", "license", "archived", "pushed_at", "language",
+                           "description", "full_name"):
+            self.assertNotIn(repo_field, item)
+
+    def test_query_url_is_the_keyless_algolia_story_endpoint(self):
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            return FAKE_HN
+        p.hn_search(["incremental test selection"], 5, fetch=fetch)
+        u = urllib.parse.urlparse(seen[0])
+        params = urllib.parse.parse_qs(u.query)
+        self.assertEqual((u.scheme, u.netloc, u.path),
+                         ("https", "hn.algolia.com", "/api/v1/search"))
+        self.assertEqual(params["query"], ["incremental test selection"])
+        self.assertEqual(params["tags"], ["story"], "comments and polls are not prior art")
+        self.assertEqual(params["hitsPerPage"], ["5"])
+        self.assertNotIn("apiKey", seen[0], "the Algolia endpoint is keyless")
+
+    def test_created_at_without_a_timestamp_is_empty_not_a_crash(self):
+        p = load_probe()
+        item = p.hn_search(["x"], 5,
+                           fetch=lambda url, **kw: {"hits": [{"objectID": "1"}]})[0]
+        self.assertEqual(item["kind"], "discussion")
+        self.assertEqual(item["created_at"], "")
+        self.assertIsNone(item["points"])
+        self.assertIsNone(item["title"])
+        self.assertIsNone(item["external_url"])
+        self.assertEqual(item["url"], "https://news.ycombinator.com/item?id=1")
+
+    def test_a_hit_without_an_object_id_has_no_url_rather_than_id_none(self):
+        p = load_probe()
+        item = p.hn_search(["x"], 5, fetch=lambda url, **kw: {"hits": [{}]})[0]
+        self.assertIsNone(item["url"])
+
+class TestHnSourceDispatch(unittest.TestCase):
+    """`--source` picks the legs: auto follows §5.5, `hn`/`github` are forced single sources."""
+
+    def test_explicit_hn_queries_only_hn(self):
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            return FAKE_HN
+        code, env = p.search_envelope(["incremental test selection"], source="hn", fetch=fetch)
+        self.assertEqual(code, p.EXIT_OK)
+        self.assertEqual(env["status"], "ok")
+        self.assertIsNone(env["reason"])
+        self.assertEqual([r["kind"] for r in env["results"]], ["discussion"])
+        self.assertEqual(len(seen), 1)
+        self.assertIn("hn.algolia.com", seen[0])
+
+    def test_hn_source_entry_is_plain_tier_with_the_nbhits_total(self):
+        # §4.3's HN example: tier "plain" (HN has no filter ladder) and `total` = the
+        # source's own match count (nbHits), never len(results), which hitsPerPage caps.
+        p = load_probe()
+        payload = {"nbHits": 42, "hits": FAKE_HN["hits"]}
+        env = p.search_envelope(["x"], source="hn", fetch=lambda url, **kw: payload)[1]
+        self.assertEqual(env["sources"],
+                         [{"source": "hn", "tier": "plain", "total": 42, "status": "ok"}])
+        self.assertEqual(len(env["results"]), 1)
+
+    def test_explicit_hn_failure_degrades_because_hn_was_the_whole_operation(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            raise p.Timeout("boom")
+        code, env = p.search_envelope(["x"], source="hn", fetch=fetch)
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(env["status"], "degraded")
+        self.assertEqual(env["reason"], "timeout")
+        self.assertEqual(env["sources"], [{"source": "hn", "status": "degraded"}],
+                         "_degraded must name the leg that actually failed")
+        self.assertEqual(env["results"], [])
+
+    def test_explicit_github_never_calls_hn(self):
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            return {"total_count": 0, "items": []}
+        env = p.search_envelope(["x"], source="github", fetch=fetch)[1]
+        self.assertFalse(any("hn.algolia.com" in u for u in seen))
+        self.assertEqual([s["source"] for s in env["sources"]], ["github"])
+
+    def test_hn_failure_marks_the_source_failed_without_failing_the_operation(self):
+        # Controller ruling: `reason` is reserved for whole-operation degradation. HN is
+        # a supplement, so its failure is partial — the envelope stays ok / exit 0, and
+        # the source list is what tells the caller HN did not answer.
+        p = load_probe()
+        def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                raise p.NetworkError("proxy refused")
+            return {"total_count": 0, "items": []}
+        code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
+        self.assertEqual((code, env["status"], env["reason"], env["results"]),
+                         (p.EXIT_OK, "ok", None, []))
+        self.assertEqual(env["sources"],
+                         [{"source": "github", "tier": "none", "total": 0, "status": "ok"},
+                          {"source": "hn", "status": "failed"}])
+
+    def test_hn_consulted_but_empty_is_still_the_true_nothing_signal(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                return {"nbHits": 0, "hits": []}
+            return {"total_count": 0, "items": []}
+        code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
+        self.assertEqual((code, env["status"], env["reason"], env["results"]),
+                         (p.EXIT_OK, "ok", None, []))
+        self.assertEqual(env["sources"][1],
+                         {"source": "hn", "tier": "plain", "total": 0, "status": "ok"})
+
+    def test_github_failure_degrades_without_asking_hn(self):
+        # §5.3 puts HN in the retry path for an EMPTY GitHub result, not for a failed
+        # one: a failed primary is the whole-operation degradation, not a cue to guess.
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            raise urllib.error.URLError("no route to host")
+        code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
+        self.assertEqual((code, env["reason"]), (p.EXIT_DEGRADED, "network"))
+        self.assertFalse(any("hn.algolia.com" in u for u in seen))
+
+    def test_hn_may_spend_the_searchs_one_retry(self):
+        # The retry budget belongs to the search, not to GitHub: when GitHub came back
+        # empty without spending it, HN gets the same one-retry treatment on a 429.
+        p = load_probe()
+        hn_calls = []
+        def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                hn_calls.append(url)
+                if len(hn_calls) == 1:
+                    raise p.RateLimited("429")
+                return FAKE_HN
+            return {"total_count": 0, "items": []}
+        with unittest.mock.patch.object(p.time, "sleep", lambda seconds: None):
+            env = p.search_envelope(["x"], source="auto", fetch=fetch)[1]
+        self.assertEqual(len(hn_calls), 2)
+        self.assertEqual(env["sources"][1],
+                         {"source": "hn", "tier": "plain", "total": 1, "status": "ok"})
+
+    def test_an_internal_error_in_hn_reaches_stderr(self):
+        # A malformed HN body is a probe.py-side surprise, not a network condition; the
+        # envelope keeps its partial-failure shape but the bug must still be diagnosable.
+        p = load_probe()
+        def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                return None                      # AttributeError inside _hn_hits
+            return {"total_count": 0, "items": []}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
+        self.assertEqual((code, env["status"], env["reason"]), (p.EXIT_OK, "ok", None))
+        self.assertEqual(env["sources"][1], {"source": "hn", "status": "failed"})
+        self.assertIn("AttributeError", err.getvalue())
+
+class TestMainHnSource(unittest.TestCase):
+    """§10.1 evals run `--source hn`: the flag must really reach Algolia, not GitHub."""
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def test_source_hn_runs_the_real_pipeline_against_algolia_only(self):
+        p = load_probe()
+        seen = []
+        def urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            if "hn.algolia.com" not in req.full_url:
+                raise AssertionError("--source hn must not call GitHub: %s" % req.full_url)
+            return self._Resp(json.dumps(FAKE_HN).encode("utf-8"))
+        out = io.StringIO()
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
+                contextlib.redirect_stdout(out):
+            code = p.main(["search", "--terms", "incremental test selection",
+                           "--source", "hn"])
+        self.assertEqual(code, 0)
+        env = json.loads(out.getvalue())
+        self.assertEqual([s["source"] for s in env["sources"]], ["hn"])
+        self.assertEqual(env["results"][0]["kind"], "discussion")
+        self.assertEqual(env["results"][0]["url"],
+                         "https://news.ycombinator.com/item?id=47382910")
+
 class TestSearchEnvelope(unittest.TestCase):
     """Spec 4.3: status / reason / sources / results are all required, always."""
 

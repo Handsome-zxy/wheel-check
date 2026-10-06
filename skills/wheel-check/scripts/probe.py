@@ -111,20 +111,22 @@ def _classify(exc):
         return NetworkError(type(exc).__name__)
     return InternalError(exc)                       # not a transport failure at all
 
-def _warn_internal(problem):
+def _warn_internal(problem, outcome="reported as degraded, reason null"):
     """Report an unexpected failure on stderr; stdout stays pure JSON (§4.3).
 
     Without this line a bug inside probe.py would reach the caller as an unexplained
     `degraded` and nobody would ever notice it. The global constraint sends error text
-    to stderr, which is exactly what this is.
+    to stderr, which is exactly what this is. `outcome` names what the envelope did
+    about it, so the same diagnostic stays truthful for the HN supplement, whose
+    failure leaves the envelope `ok` with that source marked `failed`.
     """
     cause = problem.cause
     message = str(cause)
     detail = type(cause).__name__
     if message and len(message) <= 200:             # long tracebacks are unreadable
         detail = "%s: %s" % (detail, message)
-    print("error: probe.py unexpected failure: %s (reported as degraded, reason null)"
-          % detail, file=sys.stderr)
+    print("error: probe.py unexpected failure: %s (%s)" % (detail, outcome),
+          file=sys.stderr)
 
 def _with_retry(fn, attempts=2, backoff=RETRY_BACKOFF):
     """Call fn(); on a rate limit sleep `backoff` and try again, then re-raise.
@@ -228,14 +230,74 @@ def github_search(terms, limit, fetch=urlopen_json, strict_only=False):
                     "results": [normalize_repo(i) for i in items]}
     return {"tier": "none", "total": 0, "results": []}
 
+HN_ENDPOINT = "https://hn.algolia.com/api/v1/search"
+HN_ITEM = "https://news.ycombinator.com/item?id=%s"
+
+def _hn_url(terms, limit):
+    """Algolia's keyless story search: one request, no quota (§2.2b).
+
+    `tags=story` keeps the recall on submissions — a comment hit is not a project.
+    Measured win over GitHub (§2.2b): `incremental test selection` returns total=0 on
+    GitHub's filtered index and surfaces `Show HN: Testrim` here, because HN titles are
+    natural-language concepts while GitHub only indexes repo descriptions.
+    """
+    return (HN_ENDPOINT + "?query=" + urllib.parse.quote(" ".join(terms))
+            + "&tags=story&hitsPerPage=%d" % limit)
+
+def _hn_entry(hit):
+    """One Algolia hit -> a `discussion` entry (§4.3).
+
+    HN supplies a title, points, a creation date, the item URL and an external link —
+    and nothing else. No stars, no license, no archived flag: borrowing a repo-shaped
+    field here would present HN's popularity as repository maturity (§4.3, §9). A hit
+    without an objectID has no item URL at all; `None` beats `?id=None`.
+    """
+    oid = hit.get("objectID")
+    return {
+        "kind": "discussion",
+        "title": hit.get("title"),
+        "url": (HN_ITEM % oid) if oid else None,
+        "points": hit.get("points"),
+        "created_at": (hit.get("created_at") or "")[:10],
+        "external_url": hit.get("url"),
+    }
+
+def _hn_hits(terms, limit, fetch):
+    """(total, [entry]) for `terms`; the count travels separately from the entries.
+
+    `total` is the source's own match count, never `len(results)`: Algolia reports
+    `nbHits` for the whole result set while `hitsPerPage` caps what comes back, exactly
+    like GitHub's `total_count` against `per_page`. A body we cannot read raises and is
+    classified by the caller, instead of being smoothed into an empty hit list.
+    """
+    data = fetch(_hn_url(terms, limit))
+    hits = data.get("hits") or []
+    total = data.get("nbHits")
+    return (len(hits) if total is None else total), [_hn_entry(h) for h in hits]
+
+def hn_search(terms, limit, fetch=urlopen_json):
+    """Discussion entries for `terms`, in Algolia's relevance order (Task 5 interface)."""
+    return _hn_hits(terms, limit, fetch)[1]
+
+def _hn_leg(terms, limit, fetch=urlopen_json, strict_only=False):
+    """`hn_search` in the leg shape the source dispatch expects: {"tier","total","results"}.
+
+    HN has no filter ladder, so the tier is always `plain` (§4.3's HN example) and
+    `--strict` — a GitHub filter concept — is deliberately ignored.
+    """
+    total, results = _hn_hits(terms, limit, fetch)
+    return {"tier": "plain", "total": total, "results": results}
+
 def _source_legs():
     """source name -> retriever, or None when this build has no retriever for it.
 
-    Task 5 replaces the "hn" None with its retriever and Task 6 does "hf"; this is the
-    one place a source is registered, so the honest-degradation path below stops
-    firing for a source the moment its retriever exists.
+    Task 5 registers "hn" (§5.5's supplement) and Task 6 does "hf"; this is the one
+    place a source is registered, so the honest-degradation path below stops firing for
+    a source the moment its retriever exists. Every leg takes
+    `(terms, limit, fetch=..., strict_only=...)` and returns a
+    `{"tier", "total", "results"}` payload.
     """
-    return {"github": github_search, "hn": None, "hf": None}
+    return {"github": github_search, "hn": _hn_leg, "hf": None}
 
 def _degraded_reason(problem):
     """Map a classified failure onto the §4.3 `reason` vocabulary.
@@ -276,9 +338,16 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
     is the API's `total_count`, not `len(results)` — the two legitimately disagree
     because `per_page` caps the returned array (measured: total 5260, 8 returned).
 
-    `source` selects which legs run (`auto` = the default set, today GitHub only).
-    A source with no retriever in this build is a whole-operation degradation, never a
-    silent answer with another source's data; see `_source_legs`.
+    `source` selects which legs run. `auto` is the §5.5 strategy: GitHub first, and HN
+    only when GitHub came back EMPTY (a hit, however noisy, is the caller's to judge —
+    probe.py does not rank). `github`/`hn`/`hf` force a single source, and a source with
+    no retriever in this build is a whole-operation degradation, never a silent answer
+    with another source's data; see `_source_legs`.
+
+    A failed HN supplement is PARTIAL: the envelope stays ok/exit 0, `reason` stays
+    null and `sources` gains `{"source": "hn", "status": "failed"}`. The source list is
+    how the caller learns a source did not answer; `reason` is reserved for a failure
+    of the operation as a whole (§4.3).
 
     `reason` is None when the cause is outside §4.3's vocabulary (internal error,
     unimplemented source): the envelope is still `degraded`, and stderr carries the
@@ -303,10 +372,28 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
         if isinstance(problem, InternalError):
             _warn_internal(problem)
         return EXIT_DEGRADED, _degraded(_degraded_reason(problem), source=wanted)
-    return EXIT_OK, {"status": "ok", "reason": None,
-                     "sources": [{"source": wanted, "tier": found["tier"],
-                                  "total": found["total"], "status": "ok"}],
-                     "results": found["results"]}
+    sources = [{"source": wanted, "tier": found["tier"],
+                "total": found["total"], "status": "ok"}]
+    results = found["results"]
+    if source == "auto" and not results:
+        # §5.5: HN is the retry path for GitHub's semantic gap, not a parallel leg — it
+        # is asked only when the primary source came back with nothing to show. The
+        # lookup sits inside the try so a registry gap degrades like any other failure
+        # of the supplement instead of escaping as a traceback.
+        try:
+            hn = _source_legs()["hn"](terms, limit, fetch=retrying,
+                                      strict_only=strict_only)
+        except Exception as exc:    # noqa: BLE001 - a supplement failure is partial
+            problem = _classify(exc)
+            if isinstance(problem, InternalError):
+                _warn_internal(problem, "hn failed; the envelope stays ok")
+            sources.append({"source": "hn", "status": "failed"})
+        else:
+            sources.append({"source": "hn", "tier": hn["tier"],
+                            "total": hn["total"], "status": "ok"})
+            results = hn["results"]
+    return EXIT_OK, {"status": "ok", "reason": None, "sources": sources,
+                     "results": results}
 
 class _ArgParser(argparse.ArgumentParser):
     """ArgumentParser whose usage errors exit with EXIT_BAD_ARGS, not argparse's 2.
