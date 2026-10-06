@@ -1,7 +1,8 @@
 # wheel-check — 开发前开源先例检索 Skill · 设计文档
 
 **日期**：2026-10-06
-**状态**：已获用户批准（2026-10-06 会话），待审阅文字稿
+**状态**：已获用户批准（2026-10-06 会话，v2 扩源已批准），待审阅文字稿
+**版本**：v2（在 v1 单源设计上，按实测新增 HN 补充源与 HF 条件源）
 **蓝本**：仓库外的 `pre-build-prior-art-research.md`（未随仓库分发）的 B 方案
 **关系**：本文档**取代**仓库外的早期草案 `docs/superpowers/specs/2026-10-06-prior-art-design.md`（用户指示弃用）。早期草案的调研结论中被本文档采用的部分，均在文中标注来源。
 
@@ -56,10 +57,26 @@
 | 同上但去掉 `stars:` / `pushed:` | 8921 条，假阳性 `tcgoetz/GarminDB` 排第 2 | ⚠️ 无强过滤不可用 |
 | `(markdown viewer OR terminal markdown OR markdown renderer) …` | 78 条，**第 1 名 `charmbracelet/glow`（27596★）** | ✅ 括号 OR 有效 |
 | `(incremental test selection OR test impact analysis OR affected tests) …` | **total=0** | ❌ **强过滤会漏掉正确答案** |
+| `test impact analysis in:name,description stars:>50 fork:false` | total=3，命中全是垃圾（`-L-` / `Verified-Tweaks` / `neurons`） | ❌ **多词长短语 + 强过滤 = 杀光真答案** |
+| `test selection in:name,description stars:>50 fork:false` | total=11，命中 **`Tinder/bazel-diff`（526★，2026-10-06 更新）**、`pluff/crystalball`（353★） | ✅ **概念名词比长短语有效得多** |
 | npm `/-/v1/search` 关键词搜索 | 搜不到 `chokidar` 本身 | ❌ 仅支持精确包名 |
 | crates.io `?q=` | 第 2 名是无关的 `ratkit` | ❌ 仅支持精确包名 |
 
-**两条硬结论**：① 强过滤是让信号浮出来的唯一机制；② **强过滤会漏，必须配降过滤重试层**，否则会出现"明明有却静默跳过"——这恰是本项目最不能犯的错（§5.3）。
+### 2.2b 补充源实测（v2 新增）
+
+| 源 | 可用性 | 检索质量实测 | 判定 |
+|---|---|---|---|
+| **Hacker News（Algolia）** | ✅ 免密钥、无配额压力 | `incremental test selection` → 命中 **`Show HN: Testrim: Intelligent Test Impact Analysis`**（GitHub 对同一句返回 total=0）；`affected tests` → 命中 `cargo-affect`、Bazel 受影响测试 | ✅ **纳入为补充源**：概念句召回，补 GitHub 的语义鸿沟 |
+| **Hugging Face Hub** | ✅ 免密钥，models/datasets 均可用，带 downloads / likes | `speech to text` → 前 3 名为 1125/676/612 下载、4/1/0 likes 的小模型 | ⚠️ **仅 AI/ML 需求时启用**（条件源），否则是噪音 |
+| **GitLab 公开项目搜索** | ✅ 免密钥 | `test impact` → 前三名均 1★（最后活动 2026-04 / 2025-06 / 2023-05） | ❌ **排除**：公开实例信号≈0 |
+| Product Hunt | ❌ API 无文本搜索 | 前车之鉴：idea-reality-mcp 为此专门下架该源 | ❌ 排除 |
+| Sourcegraph / grep.app | 可用 | 回答"代码里有没有这段实现" | ❌ 排除：非"先例发现"问题（属代码抄袭检测邻域） |
+| Gitee / Bitbucket / Codeberg / SourceForge | 未实测（需 token 或已停更） | — | ❌ 本次不纳入 |
+| Stack Overflow | 可用 | 问的是"怎么写"，不是"有没有现成的" | ❌ 排除 |
+
+**三条硬结论**：① 强过滤是让信号浮出来的唯一机制；② **强过滤会漏，必须配降过滤重试层**，否则会出现"明明有却静默跳过"——这恰是本项目最不能犯的错（§5.3）；③ **检索词要用概念名词而非多词长短语**，实测 `test selection` 有效而 `test impact analysis` 全灭。
+
+> **源数量不是瓶颈，检索词与过滤强度才是。** 因此 v2 只新增 1 个无条件源（HN）+ 1 个条件源（HF），把主要工程量放在 §5.3 的检索词与重试策略上。
 
 ### 2.3 配额
 
@@ -139,12 +156,15 @@ description: Use when the user is about to build something new — a project, re
 ### 4.2 probe.py CLI
 
 ```bash
-probe.py health                                   # 探活 + 鉴权 + 配额
-probe.py search --terms "test impact analysis|affected tests" [--strict] [--limit 8]
-probe.py repo <owner/name>                        # 单个仓库硬事实（加深阶段）
+probe.py health                                   # 探活 + 鉴权 + 配额（逐源报告）
+probe.py search --terms "test selection|affected tests" \
+                [--source auto|github|hn|hf]      # 默认 auto，见 §5.6
+                [--strict] [--limit 8]
+probe.py repo <owner/name>                        # 单个仓库硬事实（加深 / 补全 HN 命中）
+probe.py package --registry npm --name chokidar   # 精确包名查询（非关键词搜索）
 ```
 
-`--terms` 为 `|` 分隔的同义词组，脚本内部合并为**一次**括号 OR 查询（受 §2.3 配额约束）。
+`--terms` 为 `|` 分隔的同义词组，脚本内部合并为**一次**括号 OR 查询（受 §2.3 配额约束）。同义词应尽量是**概念名词**（§2.2b 硬结论③），长短语会杀光召回。
 
 ### 4.3 probe.py 输出契约
 
@@ -152,19 +172,29 @@ probe.py repo <owner/name>                        # 单个仓库硬事实（加�
 {
   "status": "ok | degraded",
   "reason": "rate-limited | timeout | network | bad-args | null",
-  "tier": "strict | relaxed | plain | none",
-  "query": { "terms": ["..."], "filters": {} },
-  "total": 60,
+  "sources": [
+    { "source": "github", "tier": "strict|relaxed|plain|none", "total": 11, "status": "ok" },
+    { "source": "hn",     "tier": "plain",  "total": 3,  "status": "ok" }
+  ],
   "results": [
-    { "full_name": "paulmillr/chokidar", "url": "https://github.com/paulmillr/chokidar",
-      "stars": 12244, "pushed_at": "2026-10-04", "license": "MIT",
-      "archived": false, "language": "TypeScript", "description": "..." }
+    { "kind": "repo",
+      "full_name": "Tinder/bazel-diff", "url": "https://github.com/Tinder/bazel-diff",
+      "stars": 526, "pushed_at": "2026-10-06", "license": "Apache-2.0",
+      "archived": false, "language": "Java", "description": "..." },
+    { "kind": "discussion",
+      "title": "Show HN: Testrim – Intelligent Test Impact Analysis",
+      "url": "https://news.ycombinator.com/item?id=...", "points": 42,
+      "created_at": "2026-03-11", "external_url": "https://github.com/..." },
+    { "kind": "model",
+      "model_id": "openai/whisper-large-v3", "downloads": 2400000, "likes": 4100,
+      "url": "https://huggingface.co/openai/whisper-large-v3" }
   ]
 }
 ```
 
 - **退出码**：`0` = `ok`；`2` = `degraded`；`3` = 参数错误（`bad-args`）。
 - `status: "ok"` **且** `results: []` 是**唯一**代表"真的没有"的信号。任何其他组合，模型都必须出声。
+- **证据字段随 `kind` 而不同**：`discussion` 条目**没有** stars / license / archived。模型必须对 `discussion` 里明显对口的项目用 `probe.py repo <owner/name>` 补全，或在该条目标注"证据不全（HN 命中，未核实仓库）"——**不得把 HN 的热度当作仓库成熟度**。
 - 脚本**不判断相关性**，只回硬事实与所用过滤档位（`tier`）。
 
 ---
@@ -193,22 +223,27 @@ probe.py repo <owner/name>                        # 单个仓库硬事实（加�
 
 **依赖方向**：`SKILL.md → probe.py → GitHub REST API`。`references` 被 `SKILL.md` 单向引用。`probe.py` **不读** `references`，**不做**任何语义判断。
 
-### 5.3 数据流
+### 5.3 数据流（v2）
 
 ```
 用户提示词
   → ① 适用性判定 ──不适用──→ 静默结束（不消耗任何检索）
-  → ② 去品牌化 + 术语扩展（中文 → 英文，2–3 个同义词）
-  → ③ probe.py 强过滤查询（stars:>50 pushed:>18mo fork:false）
-       ├─ 命中 → ④ 语义重排
-       └─ 空 / 全噪音 → 放宽重试：去 pushed: → 去 stars: → 纯关键词（≤3 次，≤45s）
-  → ⑤ 判定"是否真正解决同一问题"
+  → ② 去品牌化 + 术语扩展：中文 → 英文，产出 2–3 个**概念名词**（非长短语）
+  → ③ 源策略（§5.4）：GitHub 强过滤（默认必查）；AI 类需求追加 HF
+  → ④ GitHub 结果分流
+       ├─ 命中且非全噪音 → 语义重排
+       └─ 空 / 全噪音 → 重试：先换更宽的概念名词 → 去 pushed: → 去 stars: → 纯关键词
+                        （≤3 次，≤45s）
+  → ⑤ 仍无 → 追加查询 HN（概念信号源），命中的对口条目用 probe.py repo 补全硬事实
+  → ⑥ 判定"是否真正解决同一问题"
        ├─ 有 → 结构化清单 + 询问 a/b ──→ 交回主模型
        └─ 无 → 静默结束 ─────────────→ 交回主模型
   → 任何一环失败 → degraded 出声（绝不假装"查过了没有"）
 ```
 
-### 5.4 结构化清单格式（有相关时）
+> 重试顺序的依据来自实测：**换更宽的概念名词比放宽 star 阈值更有效**（`test impact analysis` 全灭 → `test selection` 命中 526★ 在位者）。
+
+### 5.5 结构化清单格式（有相关时）
 
 必含字段（用户要求）：**项目名称 / 核心功能 / 可复用点 / 与本方案的差异 / 潜在风险**。附加证据字段：stars、最后提交、license、archived、链接。
 
@@ -225,7 +260,19 @@ probe.py repo <owner/name>                        # 单个仓库硬事实（加�
 
 未检出相关项目时：**不输出以上任何内容**，直接继续原任务。
 
-### 5.5 扩展点
+### 5.4 源策略（v2）
+
+| 源 | 角色 | 何时查 | 提供 | 不具备 |
+|---|---|---|---|---|
+| **GitHub 仓库搜索** | 主力（默认必查） | 总是 | stars / pushed_at / license / archived / language / description | — |
+| **Hacker News (Algolia)** | 补充（概念信号） | GitHub 强过滤**空或全噪音**时追加；也可与 GitHub 并查 | 标题、points、创建时间、外链 | **无 stars / 无 license**，须用 `probe.py repo` 补全 |
+| **Hugging Face Hub** | 条件源 | 仅当需求含 AI/ML 语义（模型、微调、embedding、语音、视觉、LLM 等） | model_id / downloads / likes / 数据集 | 与"可复用代码库"是两种东西，不得混为一列 |
+| npm / crates.io | 精确包名 | 用户点名包名时 | 版本、发布时间 | **关键词搜索不可用**（实测噪音） |
+| GitLab / Product Hunt / Sourcegraph / Stack Overflow | 不纳入 | — | — | 见 §2.2b 排除理由 |
+
+`--source auto`（默认）按上表决策；`--source github|hn|hf` 为人工强制单源（调试与 eval 用）。
+
+### 5.6 扩展点
 
 | 扩展点 | 做法 | 触发条件 |
 |---|---|---|
@@ -272,7 +319,7 @@ probe.py repo <owner/name>                        # 单个仓库硬事实（加�
 
 | 来源项目 | 借鉴的模块 | 适配改动点 |
 |---|---|---|
-| `aradar46/reuse-before-generate` | "多角度检索 + 双箱证据（可复用 / 需竞争）"的思路；"不做额外 LLM 调用"的分工原则 | **只保留 GitHub 单源**（实测多注册表是噪音）；术语由模型给，不由参数长文案规定 |
+| `aradar46/reuse-before-generate` | "多角度检索 + 双箱证据（可复用 / 需竞争）"的思路；"不做额外 LLM 调用"的分工原则 | **只保留 GitHub + HN + 条件 HF**（实测多注册表是噪音）；术语由模型给，不由参数长文案规定 |
 | `skyzhao1223/wheel-hub` | `adopt / adapt / inspect / avoid` 四档判定措辞 | 融合进"可复用点 / 差异"两列，不单独打分 |
 | `rjmurillo/ai-agents` 的 `programming-advisor` | 触发语表、常见重复造轮子清单（auth / 日期 / 表单校验 / CLI 解析等） | 进 `references/triage-rubric.md` 的辅助清单，**不作主判定** |
 | `shimo4228/search-first` | `Adopt / Extend / Compose / Build` 决策矩阵、Quick/Full 双模式 | 决策矩阵进 `verdicts.md` 作 a/b 选项的措辞来源 |
@@ -288,7 +335,9 @@ probe.py repo <owner/name>                        # 单个仓库硬事实（加�
 
 | 风险 | 说明 | 缓解 |
 |---|---|---|
-| **强过滤导致漏检** | 实测 `incremental test selection` 强过滤后 `total=0`，而正确答案存在 | §5.3 的三级降过滤重试；宁可多查一层，不可该找到却没找到 |
+| **强过滤导致漏检** | 实测 `incremental test selection` 强过滤后 `total=0`，而正确答案存在（HN 对同一句反而命中 Testrim） | §5.3 的"换概念名词 + 降过滤"重试链 + HN 补充源；宁可多查一层，不可该找到却没找到 |
+| **多词长短语杀光召回** | `test impact analysis` 强过滤 total=3 全垃圾；`test selection` 命中 526★ 在位者 | `query-patterns.md` 强制"概念名词优先"；重试第一步是换词而非放宽阈值 |
+| **HN 命中缺乏硬事实** | HN 只有标题/热度/外链，**没有 stars 与 license** | 对口条目必须 `probe.py repo` 补全，否则标注"证据不全"；**禁止把 HN 热度当仓库成熟度** |
 | **精度是真正的难点** | 检索是几天的事，精度是几个月的事；实测 top 5 内仍有假阳性（`GarminDB`） | triage-rubric 显式判定 + 静默契约 + 用例集驱动迭代 |
 | **触发是概率性的** | skill 靠 description 让宿主自行决定是否加载，做不到 100% | description 迭代 + RED/GREEN 实测触发；必要时加插件层 |
 | **语义鸿沟** | 提示词词汇 ≠ 仓库词汇（"改完文件只跑受影响的测试" vs test impact analysis） | 去品牌化 + 术语扩展（§5.3②）；中文必须先转英文检索式 |
@@ -309,7 +358,7 @@ probe.py repo <owner/name>                        # 单个仓库硬事实（加�
 | **GREEN** | 把 skill 软链进 `~/.dsh/skills/`，同一批提示再跑一遍 | `evals/results-GREEN.md` |
 | **REFACTOR** | 提取新的规避话术 → 补入 SKILL.md 的反规避条目 → 重跑 | 结果文件追加 |
 
-场景覆盖：4 个"有明确先例"（应出声并问 a/b）+ 2 个"故意无先例"（应静默）+ 1 个"不适用"（改 bug，应完全不触发）+ 1 个"失败路径"（断网/坏参数，应出声）。
+场景覆盖：4 个"有明确先例"（应出声并问 a/b，其中 1 个必须是**只有 HN 命中而 GitHub 全灭**的概念句）+ 1 个 AI/ML 需求（验证 HF 条件源启用）+ 2 个"故意无先例"（应静默）+ 1 个"不适用"（改 bug，应完全不触发）+ 1 个"失败路径"（断网/坏参数，应出声）。
 
 ### 10.2 指标（本次人工记录，自动化留待后续）
 
@@ -326,7 +375,7 @@ probe.py repo <owner/name>                        # 单个仓库硬事实（加�
 
 | 阶段 | 产出 | 验收标准 |
 |---|---|---|
-| **M1** | `probe.py`（health / search / repo） | 对 3 个已知查询返回正确硬事实；限流时正确返回 `degraded`；非 ASCII 输出不崩 |
+| **M1** | `probe.py`（health / search / repo / package，含三源） | 对 3 个已知查询返回正确硬事实；GitHub 强过滤为空时 HN 兜底生效；HF 仅在 AI 类需求下被查；限流时正确返回 `degraded`；非 ASCII 输出不崩 |
 | **M2** | `SKILL.md` + `references/`（4 个文件） | RED/GREEN 两轮结果文件齐备；静默正确率 100%；出声正确率 100% |
 | **M3** | `evals/cases.jsonl` + 结果记录 | 用例集 ≥10 条，含 ≥2 条假需求 |
 | **M4** | `README.md`（双语）+ `LICENSE` + 安装说明 | 陌生人可从零装上；`skills/wheel-check/` 拷进任意宿主 skill 目录即可用 |
@@ -341,6 +390,8 @@ probe.py repo <owner/name>                        # 单个仓库硬事实（加�
 | 仓库位置 | 独立 git 仓库（本机路径不入库） | 用户选定；可迁移可分发 |
 | 安装方式 | 拷贝/软链 `skills/wheel-check/` 到宿主 skill 目录 | 零安装摩擦；DSH 侧用目录联接做实测 |
 | 数据层语言 | Python（纯 stdlib） | 本机实测：curl 坏、Node 抖动、Python 稳定；三平台普遍自带 |
-| 检索源 | 仅 GitHub 仓库搜索（主力）+ 精确包名（可选）+ 可选富化 | 实测多注册表为噪音 |
+| 检索源 | GitHub 仓库搜索（主力、默认必查）+ Hacker News Algolia（补充、概念信号）+ Hugging Face Hub（条件、仅 AI/ML 需求）+ 精确包名查询 | 实测：GitHub 强过滤唯一主力；HN 能补概念句漏检；HF 对 AI 需求有效但通用需求是噪音；GitLab/PH/Sourcegraph/SO 经实测或前车之鉴排除 |
 | 分档 | 二分：相关则问 a/b，不相关则静默 | 用户本次指令；旧草案的弱/中/强三档已弃用 |
 | 失败处理 | `degraded` 必须出声 | 旧草案的关键洞见：现有同类工具把"没搜到"与"没搜成"混为一谈 |
+| v2 扩源（2026-10-06 用户批准） | 新增 HN 为无条件补充源、HF 为 AI 条件源；其余候选社区经实测排除 | 实测：HN 对概念句的召回是 GitHub 的补集（`Testrim` 案例）；GitLab 公开搜索前三名均 1★；HF 对 AI 需求有效但对通用需求是噪音 |
+| v2 检索词规则 | 概念名词优先于多词长短语；重试第一步是换词而非放宽阈值 | 实测：`test impact analysis` total=3 全垃圾 vs `test selection` 命中 526★ 在位者 |
