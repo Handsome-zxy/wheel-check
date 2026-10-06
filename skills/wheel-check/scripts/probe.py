@@ -556,6 +556,13 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
             problem = _classify(exc)
             if isinstance(problem, InternalError):
                 _warn_internal(problem, "hf failed; the envelope stays ok")
+            else:
+                # Spec v2.2: a failed source must be visible to a HUMAN too, not only as a
+                # `sources` entry on stdout. This matters most exactly when GitHub and HN
+                # answered nothing: `ok` + `[]` is then also the shape of "there genuinely
+                # is no precedent", and the caller must not read a dead Hub as that.
+                _warn("error: hf supplement failed (%s); the envelope stays ok, so this "
+                      "search is incomplete" % _degraded_reason(problem))
             sources.append({"source": "hf", "status": "failed"})
         else:
             sources.append(hf_entry)

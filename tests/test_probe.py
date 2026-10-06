@@ -1395,6 +1395,23 @@ class TestHuggingFaceIsAppended(unittest.TestCase):
         self.assertEqual([r["kind"] for r in env["results"]], ["repo"],
                          "github's answer survives a failed model search")
 
+    def test_a_failed_hf_supplement_also_reports_its_reason_on_stderr(self):
+        # Spec v2.2: the caller must read any non-ok source as "this search was
+        # incomplete", and the data layer must put that source's failure reason on stderr
+        # so a human has a channel too (stdout stays pure JSON).
+        p = load_probe()
+        def fetch(url, **kw):
+            if "huggingface.co" in url:
+                raise p.Timeout("socket-timeout")
+            return {"total_count": 1, "items": [FAKE_REPO]}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
+        self.assertEqual((code, env["status"]), (p.EXIT_OK, "ok"))
+        self.assertEqual(env["sources"][1], {"source": "hf", "status": "failed"})
+        self.assertIn("hf", err.getvalue())
+        self.assertIn("timeout", err.getvalue())
+
     def test_an_internal_error_in_hf_reaches_stderr(self):
         # A body that is not the documented array is a probe.py-side surprise, not "no
         # models": the envelope keeps its partial-failure shape and the bug is diagnosable.
