@@ -12,3 +12,6 @@ Thumbs.db
 
 # wheel-check runtime artifacts
 *.tmp
+
+# SDD scratch workspace
+.superpowers/
