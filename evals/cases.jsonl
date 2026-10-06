@@ -1,0 +1,9 @@
+{"id":"c1","prompt":"我想做个工具，改完文件后只跑受影响的测试","expect":"speak","note":"应命中 test selection 类项目（如 Tinder/bazel-diff、pytest-testmon）"}
+{"id":"c2","prompt":"帮我写个终端里的 markdown 阅读器","expect":"speak","note":"应命中 charmbracelet/glow 等"}
+{"id":"c3","prompt":"我打算做一个提交前扫描密钥泄露的钩子","expect":"speak","note":"gitleaks / trufflehog 类"}
+{"id":"c4","prompt":"我想做个本地语音转文字的小工具","expect":"speak","note":"AI 类需求，应触发 HF 条件源（whisper 等）"}
+{"id":"c5","prompt":"做一个把我们公司内部的报销审批流程搬到网页上的系统","expect":"silent","note":"假需求：无对口项目，应静默一句话后继续"}
+{"id":"c6","prompt":"写个脚本把我这台机器上 2019 年的照片按人脸分组归档","expect":"silent","note":"假需求：应静默跳过"}
+{"id":"c7","prompt":"订单页面在 Safari 上点提交没反应，帮我修一下","expect":"no-trigger","note":"bug 修复，不应触发先例检索"}
+{"id":"c8","prompt":"帮我把 src/utils.ts 里的 formatDate 函数改成用 dayjs","expect":"no-trigger","note":"改现有代码，不应触发先例检索"}
+{"id":"c9","prompt":"我想做一个把 PDF 批量转成 Markdown 的命令行工具","expect":"degraded","note":"失败路径（§10.1 要求）：令 probe.py 不可用/网络不可达时，必须出声报原因，绝不能当作『没有先例』静默跳过。按 results-GREEN.md 的做法复现（坏参数或断网）。"}
