@@ -51,11 +51,17 @@ def build_query(terms, suffix):
     One request per tier: unauthenticated GitHub search allows only 10/minute, so
     every term is folded into a single query instead of one request per term.
 
-    Deliberately unquoted and unparenthesised (measured live): quoting forces an
-    exact-phrase match and cut recall 11 -> 1 for one concept noun, and a
-    parenthesised OR is not honoured as a boolean grouping at all (11108 noise
-    hits). Callers must send concept nouns, never long phrases.
+    Unquoted, measured live (2026-10-06). Quoting forces an exact-phrase match
+    against name/description and collapsed `test selection` 11 -> 1 and a quoted
+    pair -> 0 — a silent skip. GitHub *does* honour a parenthesised OR, but over
+    generic concept nouns it degenerates into near-synonym noise (11108), so we
+    do not promise a union: multi-term input is space-joined AND and the caller
+    should send ONE concept noun per request.
     """
+    if isinstance(terms, str):
+        raise ValueError(
+            "build_query expects a list of terms, got the raw string %r; run "
+            "validate_terms() first (a string would be joined per character)" % terms)
     return " ".join(terms) + suffix
 
 def normalize_repo(item):
@@ -72,6 +78,15 @@ def normalize_repo(item):
         "description": item.get("description"),
     }
 
+def _per_page(limit):
+    """Clamp limit for programmatic callers: GitHub accepts per_page 1..100 only.
+
+    Measured: per_page=0 and per_page=101 both return HTTP 200 with the value
+    silently normalised (per_page=0 came back with MORE items than requested), so
+    an out-of-range value must never reach the API.
+    """
+    return max(1, min(100, int(limit)))
+
 def github_search(terms, limit, fetch=urlopen_json, strict_only=False):
     """Try the tiers in order; first tier with hits wins.
 
@@ -83,7 +98,7 @@ def github_search(terms, limit, fetch=urlopen_json, strict_only=False):
     for tier, suffix in tiers:
         url = ("https://api.github.com/search/repositories?q="
                + urllib.parse.quote(build_query(terms, suffix))
-               + "&sort=stars&order=desc&per_page=%d" % limit)
+               + "&sort=stars&order=desc&per_page=%d" % _per_page(limit))
         data = fetch(url)
         items = data.get("items") or []
         if items:
@@ -103,6 +118,16 @@ class _ArgParser(argparse.ArgumentParser):
         print("%s: error: %s" % (self.prog, message), file=sys.stderr)
         raise SystemExit(EXIT_BAD_ARGS)
 
+def _limit_arg(raw):
+    """argparse `type` for --limit: an out-of-range value is a bad-args call (exit 3)."""
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("--limit must be an integer, got %r" % raw)
+    if not 1 <= value <= 100:
+        raise argparse.ArgumentTypeError("--limit must be between 1 and 100, got %d" % value)
+    return value
+
 def build_parser():
     ap = _ArgParser(prog="probe.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -111,7 +136,7 @@ def build_parser():
     s.add_argument("--terms", required=True)
     s.add_argument("--source", default="auto", choices=["auto", "github", "hn", "hf"])
     s.add_argument("--strict", action="store_true")
-    s.add_argument("--limit", type=int, default=8)
+    s.add_argument("--limit", type=_limit_arg, default=8)
     r = sub.add_parser("repo")
     r.add_argument("full_name")
     return ap

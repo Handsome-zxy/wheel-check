@@ -105,6 +105,35 @@ class TestMainSearchTerms(unittest.TestCase):
         p = load_probe()
         self.assertEqual(p.main(["search", "--terms", " a |  | b | "]), 0)
 
+class TestCliLimitBounds(unittest.TestCase):
+    """An out-of-range --limit is a malformed call: exit 3, not a silent clamp."""
+
+    def _run(self, argv):
+        p = load_probe()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = p.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_limit_zero_exits_3(self):
+        code, out, err = self._run(["search", "--terms", "x", "--limit", "0"])
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")
+        self.assertIn("--limit", err)
+
+    def test_limit_101_exits_3(self):
+        code, out, err = self._run(["search", "--terms", "x", "--limit", "101"])
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")
+        self.assertIn("--limit", err)
+
+    def test_non_integer_limit_exits_3(self):
+        self.assertEqual(self._run(["search", "--terms", "x", "--limit", "abc"])[0], 3)
+
+    def test_boundary_values_are_accepted(self):
+        self.assertEqual(self._run(["search", "--terms", "x", "--limit", "1"])[0], 0)
+        self.assertEqual(self._run(["search", "--terms", "x", "--limit", "100"])[0], 0)
+
 FAKE_REPO = {
     "full_name": "Tinder/bazel-diff", "html_url": "https://github.com/Tinder/bazel-diff",
     "stargazers_count": 526, "pushed_at": "2026-10-06T04:00:00Z",
@@ -170,8 +199,11 @@ class TestTierDefinitions(unittest.TestCase):
 class TestBuildQuery(unittest.TestCase):
     """Contract (controller ruling): plain terms, space-joined. No quotes, no parens.
 
-    Quoting a concept noun forced an exact-phrase match (measured 11 -> 1 hits);
-    a parenthesised OR is not honoured by GitHub (measured 11108 noise hits).
+    Quoting forces an exact-phrase match against name/description: measured
+    `test selection` 11 -> 1 and a quoted pair -> 0 (a silent skip). A
+    parenthesised OR *is* honoured, but over generic concept nouns it degenerates
+    into near-synonym noise (11108), so multi-term input is space-joined AND
+    instead of promising a union.
     """
 
     def test_multiple_terms_are_space_joined_as_plain_terms(self):
@@ -193,6 +225,20 @@ class TestBuildQuery(unittest.TestCase):
     def test_build_query_appends_the_tier_suffix_verbatim(self):
         p = load_probe()
         self.assertEqual(p.build_query(["a"], " fork:false"), "a fork:false")
+
+class TestBuildQueryRejectsRawString(unittest.TestCase):
+    """`main()` hands over a cleaned list; a raw `--terms` string must never iterate chars."""
+
+    def test_raw_string_raises_a_clear_value_error(self):
+        p = load_probe()
+        with self.assertRaises(ValueError) as ctx:
+            p.build_query("test selection", " stars:>50")
+        self.assertIn("list", str(ctx.exception))
+
+    def test_the_validated_list_flows_straight_in(self):
+        p = load_probe()
+        self.assertEqual(p.build_query(p.validate_terms(" test selection | affected tests | "), ""),
+                         "test selection affected tests")
 
 class TestNormalizeRepo(unittest.TestCase):
     def test_normalizes_hard_facts_to_a_kind_repo_entry(self):
@@ -267,6 +313,35 @@ class TestGithubRequestBudget(unittest.TestCase):
         q = urllib.parse.parse_qs(urllib.parse.urlparse(calls[0]).query)["q"][0]
         self.assertTrue(q.endswith(dict(p.github_tiers())["strict"]),
                         "strict tier query missing its filters: %r" % q)
+
+class TestLimitBounds(unittest.TestCase):
+    """GitHub accepts per_page 1..100 only and silently normalises anything else.
+
+    Measured: per_page=0 and per_page=101 both return HTTP 200, and per_page=0 came
+    back with more items than the requested limit — never send an out-of-range value.
+    """
+
+    def _per_page(self, p, limit):
+        calls = []
+        def fetch(url, **kw):
+            calls.append(url)
+            return {"total_count": 1, "items": [FAKE_REPO]}
+        p.github_search(["test selection"], limit, fetch=fetch)
+        return urllib.parse.parse_qs(urllib.parse.urlparse(calls[0]).query)["per_page"][0]
+
+    def test_in_range_limits_are_sent_verbatim(self):
+        p = load_probe()
+        self.assertEqual(self._per_page(p, 8), "8")
+        self.assertEqual(self._per_page(p, 1), "1")
+        self.assertEqual(self._per_page(p, 100), "100")
+
+    def test_zero_is_clamped_up_to_one(self):
+        p = load_probe()
+        self.assertEqual(self._per_page(p, 0), "1")
+
+    def test_above_max_is_clamped_down_to_one_hundred(self):
+        p = load_probe()
+        self.assertEqual(self._per_page(p, 101), "100")
 
 class TestGithubSearchStrictOnly(unittest.TestCase):
     def test_strict_only_sends_one_request_and_never_falls_through(self):
