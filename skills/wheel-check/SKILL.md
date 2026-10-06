@@ -64,7 +64,7 @@ description: Use when the user is about to build something new — a project, re
 
 ### 结构化清单（五字段 + 证据 + 选择）
 
-必含五字段：**项目名称 / 核心功能 / 可复用点 / 与本方案的差异 / 潜在风险**。每个候选附证据：stars、最后提交、license、archived、链接。建议行给出 a/b 并请用户选择，回话以**收束行**结束（见下）。完整模板见 `references/verdicts.md`。
+必含五字段：**项目名称 / 核心功能 / 可复用点 / 与本方案的差异 / 潜在风险**。每个候选附证据：stars、最后一次推送（`pushed_at`，最后一次 **push**，不是最后一次提交）、license、archived、链接。建议行给出 a/b 并请用户选择，回话以**收束行**结束（见下）。完整模板见 `references/verdicts.md`。
 
 - 证据只能来自本次返回。工具没给的字段就不写，绝不估、绝不回忆。
 - L3 拿到的 star / 日期一律标"**未核实**"。
@@ -91,7 +91,7 @@ description: Use when the user is about to build something new — a project, re
 | 只查一个词，返回空就说"没有先例" | 空可能是强过滤漏了。先换概念名词重试，再看补充源，最后才可能下"没有"的结论。 |
 | 「先问清楚用户/需求细节，再决定查什么」 | RED 实测：这条把本该静默的场景变成了反问。除 Stop-and-Ask 四种情形外，先检索、先出结论。 |
 | 「这个需求看起来不用查，我心里有数」 | RED 实测：查不查完全取决于当时怎么读请求——本 skill 存在的意义就是去掉这份随机性。触发清单命中就查一次。 |
-| 「我对这个领域很熟，直接列项目名就行」 | 记忆里的 star / license / 最后提交都会过期。本 skill 的数字必须来自本次检索。 |
+| 「我对这个领域很熟，直接列项目名就行」 | 记忆里的 star / license / 最后一次推送都会过期。本 skill 的数字必须来自本次检索。 |
 | 「清单里有项目名和定性分析就够了，用户自己能去看 star」 | 用户要据此决定复用还是自研；没有硬事实就没有决策依据。 |
 | 「工具报错了，但我大概知道结果，就按'没找到'继续」 | 这正是本项目要消除的混淆：`degraded`、以及任何 `sources[i].status != "ok"`，都必须出声。"没查成"永远不等于"没有"。 |
 | 「HN 有 42 points，说明这个项目挺成熟」 | HN 只有标题、热度和外链。成熟度必须来自仓库硬事实——要么补全，要么标"证据不全"。 |
@@ -104,5 +104,5 @@ description: Use when the user is about to build something new — a project, re
 |---|---|
 | `references/triage-rubric.md` | 判定候选算不算"真正解决同一问题"、确认证据字段、遇到 HN/HF 条目时 |
 | `references/query-patterns.md` | 提炼检索词、中文转英文、需要重试或降过滤时 |
-| `references/verdicts.md` | 要写最终回话时（三种终态的模板与 a/b 措辞） |
+| `references/verdicts.md` | 要写最终回话时（**四种**终态 A / A2 / B / C 的模板与 a/b 措辞） |
 | `references/reuse-map.md` | 需要说明本 skill 的判定与措辞来源时 |

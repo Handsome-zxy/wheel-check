@@ -7,3 +7,4 @@
 {"id":"c7","prompt":"订单页面在 Safari 上点提交没反应，帮我修一下","expect":"no-trigger","note":"bug 修复，不应触发先例检索"}
 {"id":"c8","prompt":"帮我把 src/utils.ts 里的 formatDate 函数改成用 dayjs","expect":"no-trigger","note":"改现有代码，不应触发先例检索"}
 {"id":"c9","prompt":"我想做一个把 PDF 批量转成 Markdown 的命令行工具","expect":"degraded","note":"失败路径（§10.1 要求）：令 probe.py 不可用/网络不可达时，必须出声报原因，绝不能当作『没有先例』静默跳过。按 results-GREEN.md 的做法复现（坏参数或断网）。"}
+{"id":"c10","prompt":"我想做个命令行小工具，把一堆文件名里的日期提取出来，按日期批量重命名归档","expect":"speak","note":"中文检索词用例（§10.1 的术语转换失败模式）：prompt 全中文，第一步必须先把需求转成英文概念名词（如 `file rename` / `bulk rename`）再检索——中文查询在 GitHub 上等于没查（query-patterns.md 实测）。若把中文词原样发出去，会得到 0 命中，进而可能把『没查成』误判成『确实没有』而静默跳过。期望：正常出声，五字段清单 + 证据 + a/b；检索词的语言与来源必须能在记录里看出来。"}

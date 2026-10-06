@@ -5,8 +5,9 @@
 > **Before you build it, check whether someone already did.** A portable agent skill (plain text + one zero-dependency Python script) that searches GitHub / Hacker News / Hugging Face for projects already solving the same problem — and speaks up when the search itself failed.
 
 - 设计文档（binding spec）：[`docs/wheel-check-design.md`](docs/wheel-check-design.md) · v2.2
-- 行为证据：[`evals/`](evals/) （`cases.jsonl` 9 条用例 + RED/GREEN 记录）
+- 行为证据：[`evals/`](evals/) （`cases.jsonl` 10 条用例 + RED/GREEN 记录）
 - 实现与 spec 的偏差：[`docs/wheel-check-design.md` §13 实现偏差记录](docs/wheel-check-design.md)
+- 决策记录（每条裁决的理由与"判断错了要付什么代价"）：[`docs/rulings.md`](docs/rulings.md)
 - 许可：MIT · 2026
 
 ---
@@ -17,7 +18,7 @@
 
 当用户要**新建**一样东西（项目、仓库、skill、plugin、子系统、工具）而代码还没开始写时，`wheel-check` 先做一次真实检索，然后只说三件事之一：**有对口先例**（五字段清单 + 证据 + a/b 询问）、**确实没有**（一句话，静默继续）、**没查成**（出声说明哪个源没应答）。
 
-分工是刻意的：**脚本保证数字是真的，模型保证判断是准的**——`probe.py` 只回硬事实（stars / 最后提交 / license / archived / 链接）与所用过滤档位，不做任何相关性判断、打分或排名；"是不是同一个问题"由模型按 `references/triage-rubric.md` 判定。
+分工是刻意的：**脚本保证数字是真的，模型保证判断是准的**——`probe.py` 只回硬事实（stars / 最后一次推送（`pushed_at`）/ license / archived / 链接）与所用过滤档位，不做任何相关性判断、打分或排名；"是不是同一个问题"由模型按 `references/triage-rubric.md` 判定。
 
 ### 2. 它解决什么问题：与同类工具的四处不同
 
@@ -129,8 +130,8 @@ python <path>/probe.py repo <owner/name>             # 单个仓库的硬事实�
 1. **重试退避只有 1.0 秒，而 GitHub 的搜索窗口是 60 秒。** 真遇到配额耗尽时，这一次重试基本只是再确认一遍 403，还多花掉 1 次/分钟的配额。真正管用的补救是设置 `GITHUB_TOKEN`，不是重试。（数值来自 §6，属 brief 指定值。）
 2. **非传输类的 5xx 会显示成 `timeout`。** 504 确实是超时；500 也归到 `timeout`——`reason` 词汇表里没有 `server-error`，加它属于改 spec。行为一致，只是措辞不够精确。
 3. **`limit` 的两条路径刻意不对称：** 程序化调用 `github_search()` / `hn_search()` / `hf_search()` 时，超范围的 `limit` 会被静默夹到 1..100；命令行 `--limit` 超范围则直接以退出码 3 拒绝（那是"调用错误"，不是"检索失败"）。
-4. **含义不明的 API 响应体会降级，而不是被读成"没有结果"。** 200 但 body 是 `{}` 或只有 `message` 时，脚本报 `degraded`（`reason: null`）并在 stderr 给出原因；真正的 `{"total_count": 0, "items": []}` 仍然是 `ok` + `results: []`。已知缺口：HN 返回的 `{}` 目前仍会被读成"0 条"（已记录，未修）。
-5. **eval 结果是人记录的，不是自动化评测**（§1.3 明确不把 eval 平台化）：`evals/cases.jsonl` 9 条用例（4 出声 / 2 静默 / 2 不触发 / 1 失败路径），结果见 `evals/results-RED.md` 与 `evals/results-GREEN.md`。**RED 基线不是"无 skill 对照"**：本轮实测的宿主能看到会话 skill 目录，部分基线 agent 因此加载了别的 skill 并停在审批门——这个有效性限制已如实记录在结果文件里。
+4. **含义不明的 API 响应体会降级，而不是被读成"没有结果"。** 200 但 body 是 `{}` 或只有 `message` 时，脚本报 `degraded`（`reason: null`）并在 stderr 给出原因；真正的 `{"total_count": 0, "items": []}` 仍然是 `ok` + `results: []`。三个源都走这条检查：HN 返回的 `{}` 同样降级，`health` 与检索器用的是同一个形状检查。
+5. **eval 结果是人记录的，不是自动化评测**（§1.3 明确不把 eval 平台化）：`evals/cases.jsonl` 10 条用例（5 出声 / 2 静默 / 2 不触发 / 1 失败路径），结果见 `evals/results-RED.md` 与 `evals/results-GREEN.md`。**RED 基线不是"无 skill 对照"**：本轮实测的宿主能看到会话 skill 目录，部分基线 agent 因此加载了别的 skill 并停在审批门——这个有效性限制已如实记录在结果文件里。
 6. **"补充源失败"只能从 `sources` 读出来。** 因为 HN 只在 GitHub 返回空时才被查询，它失败时信封恰好是"真的没有"的形状（`ok` + `[]`，`reason: null`），只有 HN 那一条 `status: "failed"` 与 stderr 一行诊断能区分二者。所以契约强制调用方检查 `any(sources[i].status != "ok")`。
 7. **HN 命中没有 stars / license**，必须用 `probe.py repo <owner/name>` 补全，补不到就标"证据不全"；**HN 的 points 不是仓库成熟度**。HF 条目是模型不是代码库，必须与仓库分列。
 8. **触发是概率性的**：skill 靠 `description` 由宿主自行决定是否加载，做不到 100%。
@@ -140,7 +141,7 @@ python <path>/probe.py repo <owner/name>             # 单个仓库的硬事实�
 ### 9. 测试与行为证据
 
 ```bash
-python -m unittest discover -s tests -t .        # 172 tests, 2 skipped
+python -m unittest discover -s tests -t .        # 173 tests, 0 skipped
 
 # 屏蔽所有 socket 后重跑同一套用例（须先 import ssl / unittest.mock：ssl 导入时要用到 socket 类）
 python -c "import ssl, unittest.mock, socket, unittest, sys; socket.socket=socket.create_connection=socket.getaddrinfo=lambda *a, **k: (_ for _ in ()).throw(OSError('blocked')); sys.exit(0 if unittest.TextTestRunner().run(unittest.TestLoader().discover('tests', top_level_dir='.')).wasSuccessful() else 1)"
@@ -148,8 +149,8 @@ python -c "import ssl, unittest.mock, socket, unittest, sys; socket.socket=socke
 
 - 测试全部注入假 `fetch`，不碰真实 API；上面第二条命令在全网不可达的条件下同样全绿——即"测试不会偷偷联网"是被验证过的，不是被假设的。（约定：任何测试都不得命中 `api.github.com`，未认证配额只有 10 次/分钟。）
 - 本机只在 **Python 3.13.3** 上实跑过（Windows PowerShell 5.1 环境）；spec §5.2 声明的最低版本是 3.8，本机没有 3.8 解释器可验，这条差异已记录在案。
-- 行为证据（用例 → 预期 → 观测）在 [`evals/`](evals/)：`cases.jsonl` 是用例集，`results-RED.md` 是基线，`results-GREEN.md` 是 skill 就位后的预期与实测回填。
-- 开发过程记录（含全部裁决与已知次要点）：`.superpowers/sdd/wheel-check/progress.md`。
+- 行为证据（用例 → 预期 → 观测）在 [`evals/`](evals/)：`cases.jsonl` 是用例集，`results-RED.md` 是基线，`results-GREEN.md` 是 skill 就位后的实测记录（含未覆盖的缺口）。
+- 决策记录（每条裁决的理由与代价）：[`docs/rulings.md`](docs/rulings.md)。原始会话台账 `.superpowers/sdd/wheel-check/progress.md` 是本次构建的草稿纸，**不入库**；结论已全部提炼进 `docs/rulings.md`。
 
 ### 10. 许可
 
@@ -264,8 +265,8 @@ python <path>/probe.py repo <owner/name>             # hard facts for one repo (
 1. **The retry backoff is 1.0 s against GitHub's 60 s search window.** On genuine quota exhaustion the retry mostly re-confirms the 403 while spending one more of the 10 requests/minute. The remedy that works is `GITHUB_TOKEN`, not the retry.
 2. **A non-transport 5xx surfaces as `timeout`.** A 504 genuinely is one; a 500 also reports `timeout`, because the `reason` vocabulary has no `server-error` value and adding one would change the spec. Same behaviour, imprecise wording.
 3. **`limit` behaves asymmetrically on purpose:** programmatic calls to `github_search()` / `hn_search()` / `hf_search()` silently clamp out-of-range limits to 1..100, while the CLI's `--limit` rejects them with exit 3 (that is a malformed *call*, not a failed *search*).
-4. **An ambiguous API body degrades instead of being read as "no results".** A 200 whose body is `{}` or only a `message` reports `degraded` (`reason: null`) with the cause on stderr; a genuine `{"total_count": 0, "items": []}` stays `ok` + `results: []`. Known gap: HN's `{}` is still read as "0 hits" (recorded, not fixed).
-5. **Eval results are recorded by hand, not by an automated harness** (§1.3 declines to build an eval platform): `evals/cases.jsonl` holds 9 cases (4 speak / 2 silent / 2 no-trigger / 1 failure path), with `evals/results-RED.md` and `evals/results-GREEN.md`. **The RED baseline is not a skill-free control**: in this harness agents can see the session's skill catalog, so some baseline agents loaded another skill and stopped at its approval gate — recorded honestly in the results file.
+4. **An ambiguous API body degrades instead of being read as "no results".** A 200 whose body is `{}` or only a `message` reports `degraded` (`reason: null`) with the cause on stderr; a genuine `{"total_count": 0, "items": []}` stays `ok` + `results: []`. All three sources run that check: HN's `{}` degrades too, and `health` and the retriever share the same shape check.
+5. **Eval results are recorded by hand, not by an automated harness** (§1.3 declines to build an eval platform): `evals/cases.jsonl` holds 10 cases (5 speak / 2 silent / 2 no-trigger / 1 failure path), with `evals/results-RED.md` and `evals/results-GREEN.md`. **The RED baseline is not a skill-free control**: in this harness agents can see the session's skill catalog, so some baseline agents loaded another skill and stopped at its approval gate — recorded honestly in the results file.
 6. **A failed supplement is visible only through `sources`.** Because HN is queried only when GitHub returned nothing, its failure lands on the exact shape that means "genuinely nothing" (`ok` + `[]`, `reason: null`); only HN's `status: "failed"` entry and one stderr line distinguish the two. The contract therefore requires the caller to check `any(sources[i].status != "ok")`.
 7. **HN hits carry no stars and no license** — backfill with `probe.py repo <owner/name>` or label the row "incomplete evidence"; **HN points are not repository maturity**. HF entries are models, not code libraries, and must be listed separately.
 8. **Triggering is probabilistic**: the host decides whether to load the skill from its `description`; 100% is not achievable.
@@ -275,7 +276,7 @@ python <path>/probe.py repo <owner/name>             # hard facts for one repo (
 ### 9. Tests and behavioural evidence
 
 ```bash
-python -m unittest discover -s tests -t .        # 172 tests, 2 skipped
+python -m unittest discover -s tests -t .        # 173 tests, 0 skipped
 
 # The same suite with every socket blocked (import ssl/unittest.mock first: ssl needs the socket class)
 python -c "import ssl, unittest.mock, socket, unittest, sys; socket.socket=socket.create_connection=socket.getaddrinfo=lambda *a, **k: (_ for _ in ()).throw(OSError('blocked')); sys.exit(0 if unittest.TextTestRunner().run(unittest.TestLoader().discover('tests', top_level_dir='.')).wasSuccessful() else 1)"
@@ -283,8 +284,8 @@ python -c "import ssl, unittest.mock, socket, unittest, sys; socket.socket=socke
 
 - Every test injects a fake `fetch` and none of them touches a live API; the second command above stays green with the whole network unreachable, so "the suite never phones home" is verified rather than assumed. (House rule: no test may hit `api.github.com` — the unauthenticated quota is 10 requests/minute.)
 - The suite has only ever been run on **Python 3.13.3** (Windows PowerShell 5.1). spec §5.2 declares a 3.8 floor; no 3.8 interpreter was available here, so that claim remains unverified and is recorded as such.
-- Behavioural evidence (case → expectation → observation) lives in [`evals/`](evals/): `cases.jsonl` is the case set, `results-RED.md` the baseline, `results-GREEN.md` the expected behaviour with the observed runs filled in.
-- The development record (every ruling and every deferred minor issue): `.superpowers/sdd/wheel-check/progress.md`.
+- Behavioural evidence (case → expectation → observation) lives in [`evals/`](evals/): `cases.jsonl` is the case set, `results-RED.md` the baseline, `results-GREEN.md` the observed runs with the gaps left visible.
+- The ruling record (every decision, its one-line rationale and its cost-if-wrong): [`docs/rulings.md`](docs/rulings.md). The raw session ledger `.superpowers/sdd/wheel-check/progress.md` is this build's scratch pad and is **not committed**; every conclusion was distilled into `docs/rulings.md`.
 
 ### 10. License
 

@@ -272,13 +272,21 @@ def build_query(terms, suffix):
     return " ".join(terms) + suffix
 
 def normalize_repo(item):
-    """Reduce a GitHub repo payload to the hard facts the caller may render."""
+    """Reduce a GitHub repo payload to the hard facts the caller may render.
+
+    `pushed_at` is `None` when the payload does not carry one — never `""`. An absent
+    field has no value, and `""` is a value a model can render as a fact (§4.1 forbids
+    that); `None` is the same "there is nothing here" the other absent fields use.
+    Note it is the last PUSH, not the last commit: a tag or a push to a stale branch
+    moves it forward, which is why the callers' evidence label says 最后一次推送.
+    """
+    pushed = item.get("pushed_at")
     return {
         "kind": "repo",
         "full_name": item.get("full_name"),
         "url": item.get("html_url"),
         "stars": item.get("stargazers_count"),
-        "pushed_at": (item.get("pushed_at") or "")[:10],
+        "pushed_at": pushed[:10] if pushed else None,
         "license": (item.get("license") or {}).get("spdx_id"),
         "archived": bool(item.get("archived")),
         "language": item.get("language"),
@@ -420,11 +428,19 @@ def _hn_hits(terms, limit, fetch):
 
     `total` is the source's own match count, never `len(results)`: Algolia reports
     `nbHits` for the whole result set while `hitsPerPage` caps what comes back, exactly
-    like GitHub's `total_count` against `per_page`. A body we cannot read raises and is
-    classified by the caller, instead of being smoothed into an empty hit list.
+    like GitHub's `total_count` against `per_page`.
+
+    The body goes through `_hn_page` FIRST — the same check `health` runs on the same
+    endpoint — and only then is `hits` read as a required key. Reading it with
+    `data.get("hits") or []` made a 200 that is not an Algolia story response
+    indistinguishable from a genuine empty result, and because HN is consulted exactly
+    when GitHub returned nothing, every such body landed on `ok` + `results: []`: the one
+    envelope §4.3 declares authoritative for "真的没有", with no stderr line to tell them
+    apart. Now the unreadable body raises, the caller classifies it, and the supplement
+    (or the explicitly requested source) says so on stderr instead of going quiet.
     """
-    data = fetch(_hn_url(terms, limit))
-    hits = data.get("hits") or []
+    data = _hn_page(fetch(_hn_url(terms, limit)))
+    hits = data["hits"]
     total = data.get("nbHits")
     return (len(hits) if total is None else total), [_hn_entry(h) for h in hits]
 
@@ -730,9 +746,13 @@ def _health_entry(name, url, fetch):
 
     Liveness means "this source answered with a body the retriever can actually use", not
     merely "a 200 arrived": `{}` from the Hub leaves `hf_search` raising, and a body without
-    `hits` leaves Algolia unreadable, so certifying either `ok` would send the caller to a
-    leg that cannot serve a single request. The checks are the same ones the retrievers use,
-    so health and search cannot disagree about what "answered" means.
+    `hits` leaves `_hn_hits` raising, so certifying either `ok` would send the caller to a
+    leg that cannot serve a single request. For those two the check is literally the
+    retriever's own — `HEALTH_SHAPES` maps a source to the very function its retriever calls
+    first (`_hn_page`, `_hf_models`) — so health and search cannot disagree about the same
+    body. GitHub is the deliberate exception: its liveness comes from /rate_limit, which
+    spends none of the 10 search requests/minute, so `github_quota` is not `_github_page`'s
+    twin and the two are not meant to be compared.
     """
     try:
         body = fetch(url)

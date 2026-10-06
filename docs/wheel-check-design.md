@@ -92,6 +92,7 @@ wheel-check\                                ← 独立 git 仓库（已 git init
 ├── LICENSE                                 ← M4；MIT
 ├── docs/
 │   ├── wheel-check-design.md               ← 本文档
+│   ├── rulings.md                          ← 决策记录（每条裁决 + 理由 + 代价）
 │   └── superpowers/plans/<date>-wheel-check.md  ← 实施计划（writing-plans 产出）
 ├── skills/wheel-check/                     ← 可分发载体（拷贝/软链即可安装）
 │   ├── SKILL.md                            ← 契约层
@@ -140,7 +141,7 @@ description: Use when the user is about to build something new — a project, re
 | 触发 | 用户表示要**新建**：项目、仓库、skill、plugin、子系统、目录树；进入 plan mode 做新东西；"我想做一个 X" |
 | 不触发 | 改 bug、重构、改现有代码、给现有项目加依赖、纯知识提问、只是让我解释概念 |
 | 输入 | 用户的项目描述（口语中文/英文皆可） |
-| 输出 | 有相关 → 结构化清单 + 询问 a/b；无相关 → **零输出**；失败 → 出声报原因 |
+| 输出 | 有相关 → 结构化清单 + 询问 a/b；无相关 → **零输出**（实现取"一句话"，见 §13.8）；失败 → 出声报原因 |
 
 **调用边界**（谁能调、能不能被跳过、越界即失效）：
 
@@ -173,7 +174,7 @@ probe.py package --registry npm --name chokidar   # 精确包名查询（非关�
 ```json
 {
   "status": "ok | degraded",
-  "reason": "rate-limited | timeout | network | bad-args | null",
+  "reason": "rate-limited | timeout | network | null",
   "sources": [
     { "source": "github", "tier": "strict|relaxed|plain|none", "total": 11, "status": "ok" },
     { "source": "hn",     "tier": "plain",  "total": 3,  "status": "ok" }
@@ -194,7 +195,7 @@ probe.py package --registry npm --name chokidar   # 精确包名查询（非关�
 }
 ```
 
-- **退出码**：`0` = `ok`；`2` = `degraded`；`3` = 参数错误（`bad-args`）。
+- **退出码**：`0` = `ok`；`2` = `degraded`；`3` = 参数错误（`bad-args`）。`bad-args` **不是** `reason` 的取值，它只由退出码 3 表达（见 §13.9）。
 - `status: "ok"` **且** `results: []` 是**唯一**代表"真的没有"的信号。任何其他组合，模型都必须出声。
 - **per-source 状态词汇（v2.2 补齐）**：`sources[i].status ∈ {"ok", "failed", "degraded"}`。
   - `"ok"`：该源被查询且成功。
@@ -412,7 +413,7 @@ probe.py package --registry npm --name chokidar   # 精确包名查询（非关�
 
 ## 13. 实现偏差记录（Task 10 收口，2026-10-06）
 
-本节记录 **实现与本文档（spec）不一致的地方**，以及每处偏差的处置。规则：spec 是约束权威，凡是实现偏离 spec 的地方，要么改回实现，要么在此记录并说明理由；下面每一行都是后者——偏差是有意的，代价与替代方案一并写明。逐条裁决的原始记录见 `.superpowers/sdd/wheel-check/progress.md`。
+本节记录 **实现与本文档（spec）不一致的地方**，以及每处偏差的处置。规则：spec 是约束权威，凡是实现偏离 spec 的地方，要么改回实现，要么在此记录并说明理由；下面每一行都是后者——偏差是有意的，代价与替代方案一并写明。**逐条裁决（含每条的理由与"判断错了要付什么代价"）见入库的 [`docs/rulings.md`](rulings.md)**；原始会话台账 `.superpowers/sdd/wheel-check/progress.md` 是本次构建的草稿纸、不入库。
 
 ### 13.1 §4.2 的 `package` 子命令：**未实现**（有意留置）
 
@@ -459,4 +460,20 @@ probe.py package --registry npm --name chokidar   # 精确包名查询（非关�
 
 - `--limit`：CLI 超范围 → 退出码 3（调用错误）；程序化调用 → 静默夹到 1..100（边界保护）。spec 未规定程序化路径，二者都符合"参数错误不静默"的字面要求，故只在此说明其不对称是有意的。
 - `total`：GitHub 是 `total_count`、HN 是 `nbHits`，而 **HF 的 `total` 只能是 `len(results)`**——该端点只返回裸数组，没有匹配数可言。§4.3 从未定义 `total`，Task 6 的裁决是"不许发明数字"，因此 HF 的 `total` 必须被读成"Hub 返回了 N 条"，合同层（`references/`）已按此措辞。
+
+### 13.8 "确实没有"时的静默是**一句话**，不是零输出
+
+- spec 原文：§1.2「没查到 → **静默跳过**，不输出任何检索痕迹，直接把控制权交回主模型」；§4.1 输出行「无相关 → **零输出**」。
+- 实现：合同层**回一句话**——「未发现可直接复用的开源方案。」——然后**立刻继续原任务**（`SKILL.md` 第三步顺序表第 3 行、`references/verdicts.md` 终态 B）。除此之外仍然什么都不输出：不提问、不列近似候选、不报告查了哪些词 / 哪些源 / 查了几次，也不写"要不要我换个词再查"。§4.1 的"零输出"在实现里被读成"不输出任何**清单/检索痕迹**"，不是"输出零个字符"。
+- 理由：**RED 实测**。基线 agent 把"没找到"变成了反问用户（c5 问"这个系统给谁用"、c6 问澄清问题），也就是说"零输出"在真实宿主里会退化成"用提问代替结论"——而本项目的存在理由正是去掉这份随机性。固定的一句话把这一格钉成可观察的行为：有这句话 = 走完了检索并下了"没有"的结论；没有这句话 = 还没查完就该出声（终态 A/C）。它还让 §10.2 的"静默正确率"有可判定的观测对象（`results-GREEN.md` 的 c5/c6 就是按这句话判的）。
+- 代价：严格按 §1.2/§4.1 字面实现的消费者会看到一行文字而不是零输出。这一行是**固定措辞**，人和机都能一致识别；且它不携带任何检索痕迹，spec 的意图（不干扰、不阻断、不留检索过程）未被削弱。
+- 替代方案（被否）：把"幻影提问"归因于宿主而不改 spec。但 RED 证据里它是稳定复现的失败模式（4 个用例里 3 个反问），而不是偶发噪声。
+
+### 13.9 `bad-args` **不是** `reason` 的取值，它只由退出码 3 表达
+
+- spec 原文：§4.3 的 `reason` 取值表曾写作 `"rate-limited | timeout | network | bad-args | null"`；§6 的「参数错误」行写"退出码 3，`bad-args`，不静默"。
+- 实现：**没有任何代码路径会发出带 `bad-args` 的信封。** 参数错误发生在信封产生之前：`_ArgParser.error()`（未知子命令 / 未知 `--source` / 超范围 `--limit`）与 `main()` 里的 `validate_terms` / `valid_full_name` 校验都直接返回**退出码 3**，**stdout 不打印任何 JSON**。这是有意的——一个畸形调用绝不能被读成一次检索失败（`2` 就是 `degraded`，argparse 的默认退出码恰好是 `2`，所以 `_ArgParser` 才必须覆盖它）。
+- 处置：**`bad-args` 已从 §4.3 的 `reason` 枚举中移除**（本文件 §4.3 的 JSON 与退出码说明已同步），并在 §4.3 正文写明它只由退出码 3 表达。
+- 理由：把退出码混进信封字段的枚举，会让机读方去找一个永远不会出现的值；更糟的是它暗示 `degraded` + `reason: "bad-args"` 是可能状态，从而把"调用写错了"读成"检索没成功"——正是本项目要消除的那类混淆。`reason` 的语义是"调用方能据以行动的**失败原因**"（§13.4），而参数错误根本不是检索。
+- 代价：机读方必须同时看退出码，不能只解析 stdout。这本来就是本项目的既有约定：`0`/`2`/`3` 三个退出码是契约的一部分。
 

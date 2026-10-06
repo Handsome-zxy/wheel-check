@@ -71,5 +71,6 @@ python <skill-dir>/scripts/probe.py health                      # 探活 + 鉴�
 ```
 
 - 解释器按 `python` → `py` → `python3` 顺序探测（实测本机 `python3` 是 Microsoft Store 空壳，返回空输出，故排最后）。`--help` 列出全部参数。
+- **`health` 不是一次检索结果。** 它只回答"源是否活着 / 鉴权与配额还剩多少"；它的信封同样长成 `ok` + `results: []`，但那是"**没有检索过**"，不是"检索过、确实没有先例"。判断有没有先例，只能看 `search` 的返回。
 - stdout 是一个 JSON 信封（`status` / `reason` / `sources[]` / `results[]`），诊断信息在 stderr。退出码：`0` = ok，`2` = degraded，`3` = 参数错误。
 - 未认证的 GitHub 搜索配额是 10 次/分钟；`rate-limited` 就是撞上它了。

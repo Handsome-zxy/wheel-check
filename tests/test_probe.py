@@ -288,7 +288,9 @@ class TestNormalizeRepo(unittest.TestCase):
         self.assertIsNone(out["full_name"])
         self.assertIsNone(out["url"])
         self.assertIsNone(out["stars"])
-        self.assertEqual(out["pushed_at"], "")
+        self.assertIsNone(out["pushed_at"],
+                          "an absent pushed_at must be None, never \"\": an empty string "
+                          "is a value a model can echo as a fact")
         self.assertIsNone(out["license"])
         self.assertIs(out["archived"], False)
         self.assertIsNone(out["language"])
@@ -762,30 +764,9 @@ class TestSourceDispatch(unittest.TestCase):
     """An explicit --source must never be answered with a different source's data.
 
     Silently returning GitHub repos for `--source hn` is how an eval records the wrong
-    source's data as the source's result. Until a retriever exists, asking for it
-    degrades the whole operation (exit 2) with the reason on stderr.
+    source's data as the source's result; the guard against it lives in `search_envelope`
+    and is pinned by `TestHonestSourceDegradation` (a source name that can never be real).
     """
-
-    def _unimplemented(self, p):
-        source = "hf"           # Task 6 registers it; "hn" was covered the same way
-        if p._source_legs().get(source) is not None:
-            self.skipTest("%s now has a retriever" % source)
-        return source
-
-    def test_a_source_without_a_retriever_degrades_instead_of_answering_with_github(self):
-        p = load_probe()
-        source = self._unimplemented(p)
-        calls = []
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            code, env = p.search_envelope(["x"], source=source,
-                                          fetch=lambda url, **kw: calls.append(url))
-        self.assertEqual(code, p.EXIT_DEGRADED)
-        self.assertEqual(env["status"], "degraded")
-        self.assertEqual(env["results"], [])
-        self.assertEqual(calls, [], "--source %s must not be answered with GitHub data" % source)
-        self.assertEqual(env["sources"], [{"source": source, "status": "degraded"}])
-        self.assertIn(source, err.getvalue())
 
     def test_auto_and_explicit_github_still_query_github(self):
         p = load_probe()
@@ -973,7 +954,8 @@ class TestHnSourceDispatch(unittest.TestCase):
             if "hn.algolia.com" in url:
                 raise p.NetworkError("proxy refused")
             return {"total_count": 0, "items": []}
-        code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
+        with contextlib.redirect_stderr(io.StringIO()):   # the diagnostic is expected here
+            code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
         self.assertEqual((code, env["status"], env["reason"], env["results"]),
                          (p.EXIT_OK, "ok", None, []))
         self.assertEqual(env["sources"],
@@ -991,6 +973,61 @@ class TestHnSourceDispatch(unittest.TestCase):
                          (p.EXIT_OK, "ok", None, []))
         self.assertEqual(env["sources"][1],
                          {"source": "hn", "tier": "plain", "total": 0, "status": "ok"})
+
+    def test_an_unreadable_hn_body_never_looks_like_genuinely_nothing(self):
+        # The final-review Critical: a 200 whose JSON object has no `hits` list was smoothed
+        # by `data.get("hits") or []` into "HN answered, zero results, status ok" — silently.
+        # Because HN is consulted ONLY when GitHub returned nothing, that body landed on the
+        # exact envelope §4.3 declares authoritative for "真的没有" (`ok` + `results: []`)
+        # with no stderr line, so neither the decision table's first row nor a human could
+        # tell it from a genuine empty search.
+        p = load_probe()
+        def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                return {}                        # 200, but not an Algolia story response
+            return {"total_count": 0, "items": []}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
+        self.assertEqual(env["sources"][1], {"source": "hn", "status": "failed"})
+        self.assertNotEqual(
+            err.getvalue().strip(), "",
+            "a dead supplement must speak on stderr: the envelope it leaves behind is "
+            "byte-identical to a genuine empty search")
+
+    def test_explicit_hn_with_an_unreadable_body_degrades(self):
+        # Same body, the source the caller explicitly asked for: HN was the whole operation,
+        # so it degrades (exit 2) with a classified reason of null and a stderr diagnostic.
+        p = load_probe()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="hn",
+                                          fetch=lambda url, **kw: {})
+        self.assertEqual((code, env["status"], env["reason"], env["results"]),
+                         (p.EXIT_DEGRADED, "degraded", None, []))
+        self.assertEqual(env["sources"], [{"source": "hn", "status": "degraded"}])
+        self.assertNotEqual(err.getvalue().strip(), "")
+
+    def test_health_and_the_retriever_do_not_contradict_each_other(self):
+        # The reviewer's reproduction: `health` called this body a failed HN (via `_hn_page`)
+        # while `--source hn` called it "ok, zero results". One body, one verdict — neither
+        # path may certify a body the retriever cannot read.
+        p = load_probe()
+        def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                return {}
+            if "api.github.com" in url:
+                return dict(FAKE_RATE_LIMIT)
+            return list(FAKE_HF)
+        with contextlib.redirect_stderr(io.StringIO()):
+            health_code, report = p.health_report(fetch=fetch)
+            search_code, env = p.search_envelope(["x"], source="hn", fetch=fetch)
+        hn_health = [s for s in report["sources"] if s["source"] == "hn"][0]
+        self.assertNotEqual(hn_health["status"], "ok", "health must not certify this body")
+        self.assertEqual(health_code, p.EXIT_DEGRADED)
+        self.assertNotEqual(env["sources"][0]["status"], "ok",
+                            "the retriever must not certify the same body health refuses")
+        self.assertEqual(search_code, p.EXIT_DEGRADED)
 
     def test_github_failure_degrades_without_asking_hn(self):
         # §5.3 puts HN in the retry path for an EMPTY GitHub result, not for a failed
@@ -1036,7 +1073,8 @@ class TestHnSourceDispatch(unittest.TestCase):
             if calls["github"] == 1:
                 raise p.RateLimited("429")
             return {"total_count": 0, "items": []}
-        with unittest.mock.patch.object(p.time, "sleep", lambda seconds: None):
+        with unittest.mock.patch.object(p.time, "sleep", lambda seconds: None), \
+                contextlib.redirect_stderr(io.StringIO()):   # diagnostic is expected here
             code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
         self.assertEqual(code, p.EXIT_OK)
         self.assertEqual(calls["github"], 4)      # 429 + its retry + relaxed + plain
@@ -1049,14 +1087,15 @@ class TestHnSourceDispatch(unittest.TestCase):
         p = load_probe()
         def fetch(url, **kw):
             if "hn.algolia.com" in url:
-                return None                      # AttributeError inside _hn_hits
+                return None       # `_hn_page` refuses a non-mapping before `hits` is read
             return {"total_count": 0, "items": []}
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code, env = p.search_envelope(["x"], source="auto", fetch=fetch)
         self.assertEqual((code, env["status"], env["reason"]), (p.EXIT_OK, "ok", None))
         self.assertEqual(env["sources"][1], {"source": "hn", "status": "failed"})
-        self.assertIn("AttributeError", err.getvalue())
+        self.assertIn("ValueError", err.getvalue())
+        self.assertIn("expected hits", err.getvalue())
 
     def test_a_supplement_failure_always_reaches_stderr(self):
         # §4.3 (v2.2): a supplement failure leaves the envelope `ok` + `results: []` — the
@@ -1224,21 +1263,6 @@ class TestMainSearchOutput(unittest.TestCase):
         self.assertEqual(seen, {}, "a malformed call must not become a degraded retrieval")
         self.assertEqual(out.getvalue(), "")
 
-    def test_cli_source_without_a_retriever_exits_2_and_never_calls_the_wire(self):
-        p = load_probe()
-        source = "hf"
-        if p._source_legs().get(source) is not None:
-            self.skipTest("%s now has a retriever" % source)
-        def boom(req, timeout=None):
-            raise AssertionError("a source with no retriever must not query anything")
-        out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", boom), \
-                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = p.main(["search", "--terms", "x", "--source", source])
-        self.assertEqual(code, p.EXIT_DEGRADED)
-        self.assertEqual(json.loads(out.getvalue())["status"], "degraded")
-        self.assertIn(source, err.getvalue())
-
 class TestMainEndToEnd(unittest.TestCase):
     """main() is the composition root: every failure path must RETURN an exit code.
 
@@ -1404,11 +1428,15 @@ class TestHuggingFaceGate(unittest.TestCase):
             if "huggingface.co" in url:
                 return FAKE_HF
             return {"total_count": 0, "items": []}
-        p.search_envelope(["incremental test selection"], source="auto", fetch=fetch)
-        self.assertFalse(any("huggingface.co" in u for u in seen))
-        seen.clear()
-        p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
-        self.assertTrue(any("huggingface.co" in u for u in seen))
+        # The HN supplement is consulted on both calls (GitHub answered nothing) and its
+        # stderr diagnostic is expected, not the subject: these assertions are about which
+        # URLs were requested.
+        with contextlib.redirect_stderr(io.StringIO()):
+            p.search_envelope(["incremental test selection"], source="auto", fetch=fetch)
+            self.assertFalse(any("huggingface.co" in u for u in seen))
+            seen.clear()
+            p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
+            self.assertTrue(any("huggingface.co" in u for u in seen))
 
     def test_hf_item_is_normalized_as_model(self):
         p = load_probe()
@@ -1596,7 +1624,8 @@ class TestHuggingFaceIsAppended(unittest.TestCase):
             if "huggingface.co" in url:
                 raise p.NetworkError("proxy refused")
             return {"total_count": 1, "items": [FAKE_REPO]}
-        code, env = p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
+        with contextlib.redirect_stderr(io.StringIO()):   # the diagnostic is expected here
+            code, env = p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
         self.assertEqual((code, env["status"], env["reason"]), (p.EXIT_OK, "ok", None))
         self.assertEqual(env["sources"][1], {"source": "hf", "status": "failed"})
         self.assertEqual([r["kind"] for r in env["results"]], ["repo"],
@@ -1636,8 +1665,14 @@ class TestHuggingFaceIsAppended(unittest.TestCase):
         self.assertIn("did not return a list", err.getvalue())
 
     def test_hf_consulted_but_empty_is_still_the_true_nothing_signal(self):
+        # Every source is given a body it can actually read and that carries nothing, so the
+        # envelope really is the "genuinely nothing" signal: `ok` + `[]` with every source
+        # `ok`. (A stub that hands HN a GitHub-shaped body would leave `hn` failed, and then
+        # decision-table row 1 — not this row — is what the caller must apply.)
         p = load_probe()
         def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                return {"nbHits": 0, "hits": []}
             if "huggingface.co" in url:
                 return []
             return {"total_count": 0, "items": []}
@@ -1645,6 +1680,7 @@ class TestHuggingFaceIsAppended(unittest.TestCase):
         self.assertEqual((code, env["status"], env["reason"], env["results"]),
                          (p.EXIT_OK, "ok", None, []))
         self.assertEqual([s["source"] for s in env["sources"]], ["github", "hn", "hf"])
+        self.assertTrue(all(s["status"] == "ok" for s in env["sources"]))
 
 class TestRepoCommand(unittest.TestCase):
     """§4.2: `repo <owner/name>` is the hard-fact lookup that backfills an HN hit.
@@ -2229,7 +2265,8 @@ class TestRejectedHttpStatusIsNotATransportFailure(unittest.TestCase):
         def fetch(url, **kw):
             calls.append(url)
             raise self._http_error(400)
-        with unittest.mock.patch.object(p.time, "sleep", lambda seconds: None):
+        with unittest.mock.patch.object(p.time, "sleep", lambda seconds: None), \
+                contextlib.redirect_stderr(io.StringIO()):   # diagnostic is expected here
             p.search_envelope(["x"], source="github", fetch=fetch)
         self.assertEqual(len(calls), 1)
 
