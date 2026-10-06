@@ -1156,5 +1156,666 @@ class TestEnvelopeOutputEncoding(unittest.TestCase):
         self.assertIn("增量测试选择", text)
         self.assertEqual(json.loads(text), env)
 
+FAKE_HF = [{"modelId": "openai/whisper-large-v3", "downloads": 2400000, "likes": 4100}]
+FAKE_RATE_LIMIT = {"resources": {
+    "search": {"limit": 10, "remaining": 9, "reset": 1770000000},
+    "core": {"limit": 60, "remaining": 42, "reset": 1770000000}}}
+
+class _Resp(io.BytesIO):
+    """The context-manager response the wire-level tests below feed to urlopen.
+
+    The older wire tests each define this nested; Task 6's four wire tests share one.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+class TestHuggingFaceGate(unittest.TestCase):
+    """§5.5 + Review Focus #5: HF is a CONDITIONAL source, decided by is_ai_requirement."""
+
+    def test_ai_requirement_detected(self):
+        p = load_probe()
+        self.assertTrue(p.is_ai_requirement(["local speech to text"]))
+        self.assertFalse(p.is_ai_requirement(["incremental test selection"]))
+
+    def test_ai_terms_is_exactly_the_documented_set(self):
+        p = load_probe()
+        self.assertEqual(p.AI_TERMS,
+                         {"ai", "llm", "model", "embedding", "diffusion", "speech",
+                          "vision", "transcribe", "whisper", "fine-tune", "finetune",
+                          "rag", "agent"})
+
+    def test_matching_is_word_wise_so_a_substring_never_fires(self):
+        # "chair" and "e-mail" contain the letters of "ai" but are not the word: a
+        # substring match would drag the Hub's model noise into a generic requirement.
+        p = load_probe()
+        self.assertFalse(p.is_ai_requirement(["chair"]))
+        self.assertFalse(p.is_ai_requirement(["e-mail"]))
+        self.assertTrue(p.is_ai_requirement(["An LLM based helper"]))   # case-insensitive
+        self.assertTrue(p.is_ai_requirement(["(embedding)"]))           # punctuation-tolerant
+        self.assertFalse(p.is_ai_requirement([]))
+
+    def test_hf_queried_only_for_ai_terms(self):
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            if "huggingface.co" in url:
+                return FAKE_HF
+            return {"total_count": 0, "items": []}
+        p.search_envelope(["incremental test selection"], source="auto", fetch=fetch)
+        self.assertFalse(any("huggingface.co" in u for u in seen))
+        seen.clear()
+        p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
+        self.assertTrue(any("huggingface.co" in u for u in seen))
+
+    def test_hf_item_is_normalized_as_model(self):
+        p = load_probe()
+        out = p.hf_search(["speech to text"], 5, fetch=lambda url, **kw: FAKE_HF)
+        self.assertEqual(out[0]["kind"], "model")
+        self.assertEqual(out[0]["model_id"], "openai/whisper-large-v3")
+        self.assertEqual(out[0]["url"], "https://huggingface.co/openai/whisper-large-v3")
+        self.assertEqual(out[0]["downloads"], 2400000)
+
+    def test_repo_detail_returns_hard_facts(self):
+        p = load_probe()
+        out = p.repo_detail("Tinder/bazel-diff", fetch=lambda url, **kw: FAKE_REPO)
+        self.assertEqual(out["kind"], "repo")
+        self.assertEqual(out["stars"], 526)
+        self.assertEqual(out["license"], "Apache-2.0")
+
+    def test_repo_detail_rejects_bad_full_name(self):
+        p = load_probe()
+        # stderr is redirected only so the expected diagnostic does not clutter the run;
+        # the assertion is the brief's, unchanged.
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(p.main(["repo", "not-a-full-name"]), 3)
+
+class TestHuggingFaceNormalization(unittest.TestCase):
+    """§4.3: a `model` entry carries what the Hub supplies — never a repo-shaped field.
+
+    Models are not code libraries (§5.5): stars/license/archived would present Hub
+    downloads as repository maturity, which is the confusion §9 warns about.
+    """
+
+    def test_model_entry_has_exactly_the_hub_field_set(self):
+        p = load_probe()
+        item = p.hf_search(["speech to text"], 5, fetch=lambda url, **kw: FAKE_HF)[0]
+        self.assertEqual(sorted(item), ["downloads", "kind", "likes", "model_id", "url"])
+        for repo_field in ("stars", "license", "archived", "pushed_at", "language",
+                           "description", "full_name"):
+            self.assertNotIn(repo_field, item)
+
+    def test_query_url_is_the_keyless_hub_endpoint_sorted_by_downloads(self):
+        p = load_probe()
+        seen = []
+        p.hf_search(["speech to text"], 5,
+                    fetch=lambda url, **kw: seen.append(url) or FAKE_HF)
+        u = urllib.parse.urlparse(seen[0])
+        params = urllib.parse.parse_qs(u.query)
+        self.assertEqual((u.scheme, u.netloc, u.path),
+                         ("https", "huggingface.co", "/api/models"))
+        self.assertEqual(params["search"], ["speech to text"])
+        self.assertEqual(params["limit"], ["5"])
+        self.assertEqual(params["sort"], ["downloads"])
+        self.assertEqual(params["direction"], ["-1"])
+        self.assertNotIn("token", seen[0].lower(), "the Hub endpoint is keyless")
+
+    def test_missing_id_yields_no_url_rather_than_a_fabricated_one(self):
+        # Same rule HN's hits already follow: no identifier means no URL, never "/None".
+        p = load_probe()
+        item = p.hf_search(["x"], 5, fetch=lambda url, **kw: [{"downloads": 1}])[0]
+        self.assertEqual(item["kind"], "model")
+        self.assertIsNone(item["model_id"])
+        self.assertIsNone(item["url"])
+        self.assertIsNone(item["likes"])
+
+    def test_an_empty_hub_answer_is_an_empty_list(self):
+        p = load_probe()
+        self.assertEqual(p.hf_search(["x"], 5, fetch=lambda url, **kw: []), [])
+
+class TestHuggingFaceSourceDispatch(unittest.TestCase):
+    """§5.5 / Review Focus #5: `auto` gates on the AI check, `--source hf` is forced."""
+
+    def test_hf_is_registered_in_the_dispatch_table(self):
+        p = load_probe()
+        self.assertIsNotNone(p._source_legs().get("hf"),
+                             "Task 6 replaces the None: the unimplemented-source path "
+                             "must stop firing for hf")
+
+    def test_explicit_hf_queries_only_the_hub(self):
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            return FAKE_HF
+        code, env = p.search_envelope(["speech to text"], source="hf", fetch=fetch)
+        self.assertEqual(code, p.EXIT_OK)
+        self.assertEqual(env["status"], "ok")
+        self.assertEqual([s["source"] for s in env["sources"]], ["hf"])
+        self.assertEqual(env["sources"][0]["tier"], "plain")
+        self.assertEqual(env["sources"][0]["total"], 1)
+        self.assertEqual([r["kind"] for r in env["results"]], ["model"])
+        self.assertEqual(len(seen), 1)
+        self.assertIn("huggingface.co", seen[0])
+
+    def test_explicit_hf_is_forced_even_for_a_non_ai_requirement(self):
+        # Review Focus #5: the AI gate belongs to `auto`; `--source hf` is the forced
+        # single source §5.5 reserves for debugging and evals. Skipping the query here
+        # could only be reported as ok + [] — the one lie this contract forbids.
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            return FAKE_HF
+        code, env = p.search_envelope(["incremental test selection"], source="hf", fetch=fetch)
+        self.assertEqual(code, p.EXIT_OK)
+        self.assertIn("huggingface.co", seen[0])
+        self.assertEqual([r["kind"] for r in env["results"]], ["model"])
+
+    def test_explicit_hf_failure_degrades_because_hf_was_the_whole_operation(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            raise p.NetworkError("proxy refused")
+        code, env = p.search_envelope(["speech to text"], source="hf", fetch=fetch)
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(env["status"], "degraded")
+        self.assertEqual(env["reason"], "network")
+        self.assertEqual(env["sources"], [{"source": "hf", "status": "degraded"}])
+        self.assertEqual(env["results"], [])
+
+    def test_explicit_hf_never_calls_github(self):
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            return FAKE_HF
+        p.search_envelope(["speech to text"], source="hf", fetch=fetch)
+        self.assertFalse(any("api.github.com" in u for u in seen))
+
+    def test_source_hf_runs_the_real_pipeline_against_the_hub_only(self):
+        # §10.1 evals run a forced single source: the flag must reach the Hub's API.
+        p = load_probe()
+        seen = []
+        def urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            if "huggingface.co" not in req.full_url:
+                raise AssertionError("--source hf must not call %s" % req.full_url)
+            return _Resp(json.dumps(FAKE_HF).encode("utf-8"))
+        out = io.StringIO()
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
+                contextlib.redirect_stdout(out):
+            code = p.main(["search", "--terms", "speech to text", "--source", "hf"])
+        self.assertEqual(code, 0)
+        env = json.loads(out.getvalue())
+        self.assertEqual([s["source"] for s in env["sources"]], ["hf"])
+        self.assertEqual(env["results"][0]["model_id"], "openai/whisper-large-v3")
+
+class TestHuggingFaceIsAppended(unittest.TestCase):
+    """Models are not code libraries: HF is APPENDED to the repo answers, never instead."""
+
+    def test_auto_appends_models_after_repo_hits_without_dropping_them(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            if "huggingface.co" in url:
+                return FAKE_HF
+            return {"total_count": 1, "items": [FAKE_REPO]}
+        code, env = p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
+        self.assertEqual(code, p.EXIT_OK)
+        self.assertEqual([r["kind"] for r in env["results"]], ["repo", "model"],
+                         "HF results are appended AFTER the repo hits, never in place of them")
+        self.assertEqual([s["source"] for s in env["sources"]], ["github", "hf"])
+        self.assertEqual(env["results"][0]["full_name"], "Tinder/bazel-diff")
+        self.assertEqual(env["results"][1]["model_id"], "openai/whisper-large-v3")
+
+    def test_a_non_ai_requirement_never_reaches_the_hub_in_auto(self):
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            return {"total_count": 1, "items": [FAKE_REPO]}
+        env = p.search_envelope(["incremental test selection"], source="auto", fetch=fetch)[1]
+        self.assertFalse(any("huggingface.co" in u for u in seen))
+        self.assertEqual([r["kind"] for r in env["results"]], ["repo"])
+
+    def test_a_failed_hf_supplement_is_named_in_sources_and_does_not_kill_the_answer(self):
+        # The controller's per-source ruling (the shape HN already follows): a supplement
+        # failure is PARTIAL — envelope ok, reason null, and `sources` carries the news.
+        p = load_probe()
+        def fetch(url, **kw):
+            if "huggingface.co" in url:
+                raise p.NetworkError("proxy refused")
+            return {"total_count": 1, "items": [FAKE_REPO]}
+        code, env = p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
+        self.assertEqual((code, env["status"], env["reason"]), (p.EXIT_OK, "ok", None))
+        self.assertEqual(env["sources"][1], {"source": "hf", "status": "failed"})
+        self.assertEqual([r["kind"] for r in env["results"]], ["repo"],
+                         "github's answer survives a failed model search")
+
+    def test_an_internal_error_in_hf_reaches_stderr(self):
+        # A body that is not the documented array is a probe.py-side surprise, not "no
+        # models": the envelope keeps its partial-failure shape and the bug is diagnosable.
+        p = load_probe()
+        def fetch(url, **kw):
+            if "huggingface.co" in url:
+                return None                      # hf_search refuses a non-list body
+            return {"total_count": 1, "items": [FAKE_REPO]}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
+        self.assertEqual((code, env["status"]), (p.EXIT_OK, "ok"))
+        self.assertEqual(env["sources"][1], {"source": "hf", "status": "failed"})
+        self.assertIn("ValueError", err.getvalue())
+        self.assertIn("did not return a list", err.getvalue())
+
+    def test_hf_consulted_but_empty_is_still_the_true_nothing_signal(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            if "huggingface.co" in url:
+                return []
+            return {"total_count": 0, "items": []}
+        code, env = p.search_envelope(["local speech to text"], source="auto", fetch=fetch)
+        self.assertEqual((code, env["status"], env["reason"], env["results"]),
+                         (p.EXIT_OK, "ok", None, []))
+        self.assertEqual([s["source"] for s in env["sources"]], ["github", "hn", "hf"])
+
+class TestRepoCommand(unittest.TestCase):
+    """§4.2: `repo <owner/name>` is the hard-fact lookup that backfills an HN hit.
+
+    Before Task 6 the subcommand returned exit 0 with no output at all: a caller asking
+    for one repository's facts got silence and no way to tell success from failure.
+    """
+
+    def _run(self, p, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = p.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_repo_prints_an_envelope_with_the_single_repo_entry(self):
+        p = load_probe()
+        seen = []
+        def urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            return _Resp(json.dumps(FAKE_REPO).encode("utf-8"))
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen):
+            code, out, err = self._run(p, ["repo", "Tinder/bazel-diff"])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        env = json.loads(out)
+        self.assertEqual(env["status"], "ok")
+        self.assertIsNone(env["reason"])
+        self.assertEqual(env["sources"], [{"source": "github", "status": "ok"}])
+        self.assertEqual(len(env["results"]), 1)
+        self.assertEqual(env["results"][0]["kind"], "repo")
+        self.assertEqual(env["results"][0]["full_name"], "Tinder/bazel-diff")
+        self.assertEqual(env["results"][0]["stars"], 526)
+        self.assertEqual(env["results"][0]["pushed_at"], "2026-10-06")
+        self.assertEqual(seen, ["https://api.github.com/repos/Tinder/bazel-diff"])
+
+    def test_a_full_name_without_a_slash_exits_3_with_stderr_and_no_stdout(self):
+        p = load_probe()
+        def boom(req, timeout=None):
+            raise AssertionError("a malformed full_name must not query anything")
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", boom):
+            code, out, err = self._run(p, ["repo", "not-a-full-name"])
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "", "a bad call must not print an envelope on stdout")
+        self.assertIn("error", err)
+        self.assertIn("/", err, "stderr must say what shape was expected")
+
+    def test_extra_slashes_or_an_empty_half_are_bad_args_too(self):
+        p = load_probe()
+        for bad in ("a/b/c", "/name", "owner/", ""):
+            code, out, err = self._run(p, ["repo", bad])
+            self.assertEqual(code, 3, bad)
+            self.assertEqual(out, "", bad)
+            self.assertIn("error", err, bad)
+
+    def test_a_failed_lookup_degrades_and_explains_itself_on_stderr(self):
+        p = load_probe()
+        def urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen):
+            code, out, err = self._run(p, ["repo", "Tinder/bazel-diff"])
+        self.assertEqual(code, 2)
+        env = json.loads(out)
+        self.assertEqual(env["status"], "degraded")
+        self.assertEqual(env["results"], [])
+        self.assertNotEqual((env["status"], env["results"]), ("ok", []),
+                            "a failed lookup must never look like a repository with no facts")
+        self.assertIn("404", err, "the raw HTTP status is the diagnosable fact")
+
+    def test_repo_detail_uses_the_repos_endpoint_verbatim(self):
+        p = load_probe()
+        seen = []
+        p.repo_detail("owner/name", fetch=lambda url, **kw: seen.append(url) or FAKE_REPO)
+        self.assertEqual(seen, ["https://api.github.com/repos/owner/name"])
+
+class TestHealthReport(unittest.TestCase):
+    """§4.2 + §6: `health` = liveness + auth + quota, per source, and it must SPEAK.
+
+    §6 puts the dead-network detection in this stage ("网络完全不通 | health 阶段即发现
+    → degraded / network"). A health command that exits 0 with no output cannot make
+    that call, so the report is asserted here field by field.
+    """
+
+    def test_all_legs_reachable_reports_ok_with_the_github_search_quota(self):
+        p = load_probe()
+        code, rep = p.health_report(fetch=lambda url, **kw: FAKE_RATE_LIMIT)
+        self.assertEqual(code, p.EXIT_OK)
+        self.assertEqual(rep["status"], "ok")
+        self.assertIsNone(rep["reason"])
+        self.assertEqual(rep["results"], [])
+        self.assertEqual([s["source"] for s in rep["sources"]], ["github", "hn", "hf"])
+        gh = rep["sources"][0]
+        self.assertEqual(gh["status"], "ok")
+        self.assertEqual(gh["auth"], "anonymous",
+                         "the anonymous search quota (10/min) is what this process gets")
+        self.assertEqual(gh["quota"],
+                         {"search": {"limit": 10, "remaining": 9, "reset": 1770000000},
+                          "core": {"limit": 60, "remaining": 42, "reset": 1770000000}})
+
+    def test_a_token_raised_quota_is_reported_as_authenticated(self):
+        p = load_probe()
+        body = {"resources": {"search": {"limit": 30, "remaining": 29, "reset": 1},
+                              "core": {"limit": 5000, "remaining": 4999, "reset": 1}}}
+        rep = p.health_report(fetch=lambda url, **kw: body)[1]
+        self.assertEqual(rep["sources"][0]["auth"], "token")
+        self.assertEqual(rep["sources"][0]["quota"]["search"]["limit"], 30)
+
+    def test_a_dead_leg_degrades_with_the_network_reason_and_names_the_source(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            if "hn.algolia.com" in url:
+                raise urllib.error.URLError("no route to host")
+            return FAKE_RATE_LIMIT
+        code, rep = p.health_report(fetch=fetch)
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(rep["status"], "degraded")
+        self.assertEqual(rep["reason"], "network")
+        self.assertEqual(rep["sources"][1]["status"], "failed")
+        self.assertEqual(rep["sources"][1]["reason"], "network")
+        self.assertEqual(rep["sources"][0]["status"], "ok",
+                         "one dead leg must not erase the other legs' facts")
+
+    def test_an_exhausted_search_quota_is_reported_as_rate_limited(self):
+        # "Can we search right now" is the question health answers: a reachable API with a
+        # spent SEARCH quota is a degraded answer, and §6's remedy (GITHUB_TOKEN) applies.
+        p = load_probe()
+        body = {"resources": {"search": {"limit": 10, "remaining": 0, "reset": 1770000000},
+                              "core": {"limit": 60, "remaining": 60, "reset": 1}}}
+        code, rep = p.health_report(fetch=lambda url, **kw: body)
+        self.assertEqual((code, rep["status"], rep["reason"]),
+                         (p.EXIT_DEGRADED, "degraded", "rate-limited"))
+        self.assertEqual(rep["sources"][0]["status"], "ok", "the API did answer")
+
+    def test_an_exhausted_core_quota_is_reported_without_flipping_the_verdict(self):
+        # Measured live: core 60/60 used while search still had 10/10 — `repo` was already
+        # 403ing. The facts must be in the report, but `core` only limits the repo backfill:
+        # a non-zero health code would send the skill to L2/L3 (§6) for no gain.
+        p = load_probe()
+        body = {"resources": {"search": {"limit": 10, "remaining": 10, "reset": 1},
+                              "core": {"limit": 60, "remaining": 0, "reset": 1791296439}}}
+        code, rep = p.health_report(fetch=lambda url, **kw: body)
+        self.assertEqual((code, rep["status"], rep["reason"]), (p.EXIT_OK, "ok", None))
+        self.assertEqual(rep["sources"][0]["quota"]["core"]["remaining"], 0,
+                         "the spent bucket is a reported fact, not a hidden one")
+
+    def test_health_never_spends_the_search_quota(self):
+        p = load_probe()
+        seen = []
+        p.health_report(fetch=lambda url, **kw: seen.append(url) or FAKE_RATE_LIMIT)
+        self.assertEqual(len(seen), 3, "three legs, one request each")
+        self.assertIn("api.github.com/rate_limit", seen[0])
+        self.assertFalse(any("/search/repositories" in u for u in seen),
+                         "health must not spend one of the 10 search requests/minute")
+        self.assertIn("hn.algolia.com", seen[1])
+        self.assertIn("huggingface.co", seen[2])
+
+    def test_an_unreadable_rate_limit_body_is_reported_not_smoothed(self):
+        p = load_probe()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, rep = p.health_report(fetch=lambda url, **kw: {"resources": {}})
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(rep["sources"][0]["status"], "failed")
+        self.assertIsNone(rep["sources"][0]["reason"])
+        self.assertIn("resources.search", err.getvalue())
+
+    def test_a_core_bucket_missing_from_the_body_fails_loudly(self):
+        # Both buckets are consumed by this build, so a body missing one is a shape we
+        # cannot read; reporting a quota we could not read as "ok" is the silent answer.
+        p = load_probe()
+        body = {"resources": {"search": {"limit": 10, "remaining": 9, "reset": 1}}}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, rep = p.health_report(fetch=lambda url, **kw: body)
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(rep["sources"][0]["status"], "failed")
+        self.assertIn("resources.core", err.getvalue())
+
+    def test_health_prints_the_report_on_stdout_and_exits_0_on_a_live_wire(self):
+        p = load_probe()
+        def urlopen(req, timeout=None):
+            body = FAKE_RATE_LIMIT if "api.github.com" in req.full_url else {}
+            return _Resp(json.dumps(body).encode("utf-8"))
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = p.main(["health"])
+        self.assertEqual(code, 0)
+        rep = json.loads(out.getvalue())
+        self.assertEqual(rep["status"], "ok")
+        self.assertEqual([s["source"] for s in rep["sources"]], ["github", "hn", "hf"])
+        self.assertEqual(rep["sources"][0]["quota"]["search"]["remaining"], 9)
+
+    def test_a_dead_wire_makes_health_exit_2_with_a_report_not_a_traceback(self):
+        p = load_probe()
+        def urlopen(req, timeout=None):
+            raise urllib.error.URLError("no route to host")
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = p.main(["health"])
+        self.assertEqual(code, 2)
+        rep = json.loads(out.getvalue())
+        self.assertEqual((rep["status"], rep["reason"]), ("degraded", "network"))
+        self.assertEqual([s["status"] for s in rep["sources"]], ["failed"] * 3)
+
+class TestAmbiguousGithubBody(unittest.TestCase):
+    """A body that is recognisably NOT a GitHub search response must degrade.
+
+    Task 4 review: `{}` flowed through the tier loop as "zero results", so a broken or
+    ambiguous API response was indistinguishable from a genuine "nothing exists" —
+    `ok` + `[]`, the one signal the skill reads as "stay silent" (§4.3).
+    """
+
+    def _run(self, p, payload):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="github",
+                                          fetch=lambda url, **kw: payload)
+        return code, env, err.getvalue()
+
+    def test_an_empty_dict_body_is_degraded_not_ok_empty(self):
+        p = load_probe()
+        code, env, err = self._run(p, {})
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(env["status"], "degraded")
+        self.assertEqual(env["results"], [])
+        self.assertNotEqual((env["status"], env["results"]), ("ok", []),
+                            "an unreadable body must never look like a genuine empty search")
+        self.assertIsNone(env["reason"], "the cause is outside §4.3's reason vocabulary")
+        self.assertIn("total_count", err, "stderr must name what the body was missing")
+
+    def test_a_body_with_only_a_message_key_is_degraded(self):
+        p = load_probe()
+        code, env, _ = self._run(p, {"message": "Not Found"})
+        self.assertEqual((code, env["status"], env["results"]),
+                         (p.EXIT_DEGRADED, "degraded", []))
+
+    def test_a_body_without_items_is_degraded(self):
+        p = load_probe()
+        code, env, _ = self._run(p, {"total_count": 3})
+        self.assertEqual((code, env["status"], env["results"]),
+                         (p.EXIT_DEGRADED, "degraded", []))
+
+    def test_a_contradictory_total_with_no_items_is_degraded(self):
+        # The API says matches exist but hands over none: reporting "none" here would
+        # claim "nothing exists" against the API's own count.
+        p = load_probe()
+        code, env, _ = self._run(p, {"total_count": 5, "items": []})
+        self.assertEqual((code, env["status"], env["results"]),
+                         (p.EXIT_DEGRADED, "degraded", []))
+
+    def test_a_genuine_empty_search_response_is_still_ok_empty(self):
+        p = load_probe()
+        code, env, err = self._run(p, {"total_count": 0, "items": []})
+        self.assertEqual((code, env["status"], env["reason"], env["results"]),
+                         (p.EXIT_OK, "ok", None, []))
+        self.assertEqual(err, "")
+
+    def test_the_guard_does_not_advance_to_the_next_tier(self):
+        # A body we cannot read is not evidence that the strict tier found nothing, so
+        # the relaxed/plain requests must not be spent on an API that is answering garbage.
+        p = load_probe()
+        calls = []
+        def fetch(url, **kw):
+            calls.append(url)
+            return {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            p.search_envelope(["x"], source="github", fetch=fetch)
+        self.assertEqual(len(calls), 1)
+
+class TestHonestSourceDegradation(unittest.TestCase):
+    """A source with no leg at all still degrades honestly (the path hf just left)."""
+
+    def test_an_unknown_source_degrades_with_zero_requests(self):
+        p = load_probe()
+        calls = []
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="gitlab",
+                                          fetch=lambda url, **kw: calls.append(url))
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(env["status"], "degraded")
+        self.assertEqual(env["sources"], [{"source": "gitlab", "status": "degraded"}])
+        self.assertEqual(env["results"], [])
+        self.assertEqual(calls, [], "no retriever means no request, and no GitHub substitute")
+        self.assertIn("gitlab", err.getvalue())
+
+class TestUnwritableStderrNeverChangesTheContract(unittest.TestCase):
+    """Gap 1 (Task 4 re-review): a diagnostic must not be able to break the contract.
+
+    On a host where stderr cannot be written (a closed fd 2, a broken pipe) print() raises
+    OSError. The diagnostic is a courtesy; the envelope and the exit code ARE the contract,
+    so a degraded answer has to survive a dead stderr instead of becoming a traceback with
+    exit 1 — the very outcome the degraded path exists to prevent.
+    """
+
+    class _DeadStream(object):
+        def write(self, text):
+            raise OSError(9, "Bad file descriptor")
+
+        def flush(self):
+            raise OSError(9, "Bad file descriptor")
+
+    def _with_dead_stderr(self, fn):
+        real = sys.stderr
+        sys.stderr = self._DeadStream()
+        try:
+            return fn()
+        finally:
+            sys.stderr = real
+
+    def test_a_degraded_search_survives_a_dead_stderr(self):
+        p = load_probe()
+        def run():
+            return p.search_envelope(["x"], source="github",
+                                     fetch=lambda url, **kw: {"total_count": 1,
+                                                              "items": [None]})
+        code, env = self._with_dead_stderr(run)
+        self.assertEqual((code, env["status"], env["results"]),
+                         (p.EXIT_DEGRADED, "degraded", []))
+
+    def test_a_missing_leg_survives_a_dead_stderr(self):
+        p = load_probe()
+        code, env = self._with_dead_stderr(
+            lambda: p.search_envelope(["x"], source="gitlab", fetch=lambda url, **kw: {}))
+        self.assertEqual((code, env["status"]), (p.EXIT_DEGRADED, "degraded"))
+
+    def test_bad_args_still_exit_3_with_a_dead_stderr(self):
+        p = load_probe()
+        out = io.StringIO()
+        def run():
+            with contextlib.redirect_stdout(out):
+                return p.main(["search", "--terms", ""])
+        self.assertEqual(self._with_dead_stderr(run), 3)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_a_usage_error_still_exits_3_with_a_dead_stderr(self):
+        p = load_probe()
+        self.assertEqual(
+            self._with_dead_stderr(lambda: p.main(["search", "--terms", "x",
+                                                   "--source", "nope"])), 3)
+
+class TestMalformedLegPayloads(unittest.TestCase):
+    """Gap 2 (Task 4 re-review): a leg is an outside shape, so a shape bug must degrade.
+
+    `found["tier"]`/`["total"]`/`["results"]` used to be read outside the try. With only
+    github_search and _hn_leg producing a payload that hole was invisible; hf is a third
+    producer, so a leg returning something unexpected has to degrade with a diagnostic
+    instead of escaping main() as a traceback and exit 1.
+    """
+
+    def _malformed(self, payload):
+        def leg(terms, limit, fetch=None, strict_only=False):
+            return payload
+        return leg
+
+    def test_a_github_leg_with_an_unexpected_shape_degrades_loudly(self):
+        p = load_probe()
+        p._source_legs = lambda: {"github": self._malformed({"nope": 1})}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="github",
+                                          fetch=lambda url, **kw: {})
+        self.assertEqual(code, p.EXIT_DEGRADED)
+        self.assertEqual(env["status"], "degraded")
+        self.assertEqual(env["results"], [])
+        self.assertIn("KeyError", err.getvalue())
+
+    def test_a_malformed_hn_leg_is_a_partial_failure_not_a_crash(self):
+        p = load_probe()
+        legs = p._source_legs()
+        legs["hn"] = self._malformed([])
+        p._source_legs = lambda: legs
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["x"], source="auto",
+                                          fetch=lambda url, **kw: {"total_count": 0,
+                                                                   "items": []})
+        self.assertEqual((code, env["status"]), (p.EXIT_OK, "ok"))
+        self.assertEqual(env["sources"][-1], {"source": "hn", "status": "failed"})
+        self.assertIn("TypeError", err.getvalue())
+
+    def test_a_malformed_hf_leg_is_a_partial_failure_not_a_crash(self):
+        p = load_probe()
+        legs = p._source_legs()
+        legs["hf"] = self._malformed([])
+        p._source_legs = lambda: legs
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.search_envelope(["local speech to text"], source="auto",
+                                          fetch=lambda url, **kw: {"total_count": 0,
+                                                                   "items": []})
+        self.assertEqual((code, env["status"]), (p.EXIT_OK, "ok"))
+        self.assertEqual(env["sources"][-1], {"source": "hf", "status": "failed"})
+        self.assertIn("TypeError", err.getvalue())
+
 if __name__ == "__main__":
     unittest.main()
