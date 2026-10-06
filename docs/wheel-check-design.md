@@ -1,0 +1,346 @@
+# wheel-check — 开发前开源先例检索 Skill · 设计文档
+
+**日期**：2026-10-06
+**状态**：已获用户批准（2026-10-06 会话），待审阅文字稿
+**蓝本**：仓库外的 `pre-build-prior-art-research.md`（未随仓库分发）的 B 方案
+**关系**：本文档**取代**仓库外的早期草案 `docs/superpowers/specs/2026-10-06-prior-art-design.md`（用户指示弃用）。早期草案的调研结论中被本文档采用的部分，均在文中标注来源。
+
+---
+
+## 1. 背景与目标
+
+### 1.1 问题
+
+在开始开发一个新项目 / 新模块 / 新 skill 之前，没有任何机制会强制 agent 先去查"这件事别人是不是已经成熟地做完了"。结果是重复造轮子。
+
+### 1.2 目标
+
+在用户提出"要新建某个东西"时：
+
+- 查到**真正解决同一问题**的开源项目 → 结构化返回，并让用户选 **a) 沿用这些项目继续开发** / **b) 不沿用，纯自研**；
+- 没查到 → **静默跳过**，不输出任何检索痕迹，直接把控制权交回主模型；
+- 检索失败 → **出声说明失败原因**（绝不假装"查过了，没有"）。
+
+### 1.3 非目标（明确不做）
+
+| 不做 | 原因 |
+|---|---|
+| ❌ 0–100 评分 / 评分卡 / 趋势 / pivot 建议 | 评分正是现有同类工具"打断人"的根源；本 skill 只给事实与判定 |
+| ❌ 阻断或否决用户的开发决定 | 清单是**供料**，永不阻断 |
+| ❌ 扇出 10–19 个包注册表 | 实测为噪音（见 §2.2），广度来自单源多分面而非多源 |
+| ❌ 代码抄袭检测 | 与"先例发现"是不同的东西 |
+| ❌ 多轮对话式市场调研 | 那是 idea-reality-mcp 的商业定位 |
+| ❌ 代码自动改写 / 自动采纳 | 用户选 a 也只是"继续开发时参考"，不自动改代码 |
+| ❌ eval 平台化（run.py、CI 接入） | 本次只留用例集与人工记录的结果文件；自动化评测留待后续 |
+| ❌ DSH 插件层的常驻 system prompt | skill 零安装即可被发现；插件层仅在触发率被证明不足时再加（§9） |
+
+---
+
+## 2. 实测依据（全部为本机真实调用，非推测）
+
+### 2.1 网络与解释器事实
+
+| 客户端 | 结果 | 影响 |
+|---|---|---|
+| `python`（3.13.3）/ `py`（启动器） | ✅ 均可调用 | **L1 主路径** |
+| `python3`（本机） | ❌ Microsoft Store 别名，空输出 | 启动器阶梯中排最后 |
+| Python `urllib` → `api.github.com` | ✅ HTTP 200 | **数据层用 Python** |
+| Node `fetch` → `api.github.com` | ⚠️ 本轮 200，上一轮同样代码 `fetch failed` | 抖动，不作唯一主路径 |
+| `curl.exe` → `api.github.com` | ❌ `http_code=000`（TLS 握手失败） | **禁用 curl** |
+
+### 2.2 检索质量（同一探针，真实查询）
+
+| 查询形态 | 结果 | 判定 |
+|---|---|---|
+| `file watcher in:name,description stars:>50 pushed:>2025-01-01 fork:false` | 60 条，**第 1 名即 `paulmillr/chokidar`（12244★）** | ✅ 唯一主力源 |
+| 同上但去掉 `stars:` / `pushed:` | 8921 条，假阳性 `tcgoetz/GarminDB` 排第 2 | ⚠️ 无强过滤不可用 |
+| `(markdown viewer OR terminal markdown OR markdown renderer) …` | 78 条，**第 1 名 `charmbracelet/glow`（27596★）** | ✅ 括号 OR 有效 |
+| `(incremental test selection OR test impact analysis OR affected tests) …` | **total=0** | ❌ **强过滤会漏掉正确答案** |
+| npm `/-/v1/search` 关键词搜索 | 搜不到 `chokidar` 本身 | ❌ 仅支持精确包名 |
+| crates.io `?q=` | 第 2 名是无关的 `ratkit` | ❌ 仅支持精确包名 |
+
+**两条硬结论**：① 强过滤是让信号浮出来的唯一机制；② **强过滤会漏，必须配降过滤重试层**，否则会出现"明明有却静默跳过"——这恰是本项目最不能犯的错（§5.3）。
+
+### 2.3 配额
+
+未认证 GitHub search **10 次/分钟**（本轮实测触发 403）；带 `GITHUB_TOKEN` 提升至 30 次/分钟。→ 决定了"每层一次查询、层间退避"的设计，而非"N 个词各查一次"。
+
+---
+
+## 3. 交付物与文件结构
+
+```
+wheel-check\                                ← 独立 git 仓库（已 git init）
+├── README.md                               ← M4；中英双语
+├── LICENSE                                 ← M4；MIT
+├── docs/
+│   ├── wheel-check-design.md               ← 本文档
+│   └── superpowers/plans/<date>-wheel-check.md  ← 实施计划（writing-plans 产出）
+├── skills/wheel-check/                     ← 可分发载体（拷贝/软链即可安装）
+│   ├── SKILL.md                            ← 契约层
+│   ├── references/
+│   │   ├── triage-rubric.md                ← "真正解决同一问题"判定 + 弱召回重试策略
+│   │   ├── query-patterns.md               ← 去品牌化模板 + 中→英术语映射
+│   │   ├── verdicts.md                     ← 终态措辞模板
+│   │   └── reuse-map.md                    ← 借鉴来源、可复用模块、适配改动点
+│   └── scripts/probe.py                    ← 数据层（纯 stdlib）
+└── evals/
+    ├── cases.jsonl                         ← 用例集（含"故意没有对应项目"的假需求）
+    └── results-RED.md / results-GREEN.md   ← TDD 证据
+```
+
+**职责分离原则**
+
+- **SKILL.md（契约层）**：只决定"何时开口 / 何时闭嘴 / 说什么"，不含 API 细节 → 将来替换数据层不用改。
+- **probe.py（数据层）**：只做检索、强过滤、字段裁剪、限流退避、编码处理。**绝不做**语义判断、打分、排名决策。
+- **references/（知识层）**：按需读取，渐进披露。
+
+> 关键分工：**脚本保证数字是真的，模型保证判断是准的。** 调研到的同类工具大多反着来——用模型猜 star 数，用关键词猜相关性。
+
+---
+
+## 4. 接口定义
+
+### 4.1 SKILL.md 契约
+
+**frontmatter（草稿，最终以 GREEN 阶段测试结果迭代）**
+
+```yaml
+---
+name: wheel-check
+description: Use when the user is about to build something new — a project, repo,
+  skill, plugin, subsystem or tool — before any code is written. Searches open-source
+  communities for projects that already solve the same problem and returns a short
+  structured list, or stays completely silent when nothing relevant exists. Do not
+  use for bug fixes, refactors, or edits to existing code.
+---
+```
+
+**触发 / 不触发**
+
+| | 内容 |
+|---|---|
+| 触发 | 用户表示要**新建**：项目、仓库、skill、plugin、子系统、目录树；进入 plan mode 做新东西；"我想做一个 X" |
+| 不触发 | 改 bug、重构、改现有代码、给现有项目加依赖、纯知识提问、只是让我解释概念 |
+| 输入 | 用户的项目描述（口语中文/英文皆可） |
+| 输出 | 有相关 → 结构化清单 + 询问 a/b；无相关 → **零输出**；失败 → 出声报原因 |
+
+**调用边界**（谁能调、能不能被跳过、越界即失效）：
+
+| 边界 | 规则 |
+|---|---|
+| 调用者 | 由宿主模型按 description 自动触发；也可被用户显式要求（"先查一下有没有现成的"）；可被计划类 skill 在进入 plan 阶段时调用 |
+| 权威范围 | 只对"有没有先例"这件事发言。**不**决定要不要做、不评估用户技术能力、不替用户选 a/b |
+| 可被跳过 | 允许用户在会话中显式声明"跳过先例检索"；声明后本 skill 不再触发 |
+| 幂等 | 同一次"新建"只查一次；用户已选 a 或 b 之后不重复查询 |
+| 硬性越界行为 | 阻断开发、自动改代码、自动安装依赖、把未核实数字当事实陈述——任一发生即视为违反契约 |
+| 边界 | 永不阻断原任务；不评分；不自动改代码；绝不编造 star / 日期 |
+
+### 4.2 probe.py CLI
+
+```bash
+probe.py health                                   # 探活 + 鉴权 + 配额
+probe.py search --terms "test impact analysis|affected tests" [--strict] [--limit 8]
+probe.py repo <owner/name>                        # 单个仓库硬事实（加深阶段）
+```
+
+`--terms` 为 `|` 分隔的同义词组，脚本内部合并为**一次**括号 OR 查询（受 §2.3 配额约束）。
+
+### 4.3 probe.py 输出契约
+
+```json
+{
+  "status": "ok | degraded",
+  "reason": "rate-limited | timeout | network | bad-args | null",
+  "tier": "strict | relaxed | plain | none",
+  "query": { "terms": ["..."], "filters": {} },
+  "total": 60,
+  "results": [
+    { "full_name": "paulmillr/chokidar", "url": "https://github.com/paulmillr/chokidar",
+      "stars": 12244, "pushed_at": "2026-10-04", "license": "MIT",
+      "archived": false, "language": "TypeScript", "description": "..." }
+  ]
+}
+```
+
+- **退出码**：`0` = `ok`；`2` = `degraded`；`3` = 参数错误（`bad-args`）。
+- `status: "ok"` **且** `results: []` 是**唯一**代表"真的没有"的信号。任何其他组合，模型都必须出声。
+- 脚本**不判断相关性**，只回硬事实与所用过滤档位（`tier`）。
+
+---
+
+## 5. 架构
+
+### 5.1 能力阶梯（泛用性的全部实现）
+
+同一份 `SKILL.md` 在 DSH / Claude Code / Codex / Gemini CLI / Copilot CLI 通用。差异只在"能不能取到硬事实"，因此把差异显式建模为三级阶梯，逐级降级：
+
+| 层 | 手段 | 生效条件 | 硬事实可信度 |
+|---|---|---|---|
+| **L1** | `python` → `py` → `python3 scripts/probe.py …`（按序探测） | 宿主有 shell 且解释器可用 | **完全可信** |
+| **L2** | 宿主原生 HTTP 工具抓 `api.github.com`（如 web_fetch） | L1 不可用 | 可信（编排由模型承担） |
+| **L3** | 宿主 `web_search` / `web_fetch` 查网页 | L1+L2 都不可用 | **不可信 → 必须标注"数字未核实"** |
+
+**降级必须可见**：任何一层降级都要让用户看到，绝不静默降级。L3 场景下清单里的 star / 日期必须标注为未核实，不得当作事实陈述。
+
+### 5.2 组件与依赖
+
+| 组件 | 职责 | 依赖 |
+|---|---|---|
+| `SKILL.md` | 触发判定、流程编排、静默/出声决策、能力阶梯、Stop-and-Ask 规则 | 宿主的 skill 机制 + shell + 网络 |
+| `scripts/probe.py` | GitHub 检索、强过滤、字段裁剪、限流退避、UTF-8 输出 | Python ≥3.8 标准库（`urllib`/`json`/`argparse`），零 pip |
+| `references/*.md` | 判定标准、查询改写模板、措辞模板、借鉴映射 | 无 |
+
+**依赖方向**：`SKILL.md → probe.py → GitHub REST API`。`references` 被 `SKILL.md` 单向引用。`probe.py` **不读** `references`，**不做**任何语义判断。
+
+### 5.3 数据流
+
+```
+用户提示词
+  → ① 适用性判定 ──不适用──→ 静默结束（不消耗任何检索）
+  → ② 去品牌化 + 术语扩展（中文 → 英文，2–3 个同义词）
+  → ③ probe.py 强过滤查询（stars:>50 pushed:>18mo fork:false）
+       ├─ 命中 → ④ 语义重排
+       └─ 空 / 全噪音 → 放宽重试：去 pushed: → 去 stars: → 纯关键词（≤3 次，≤45s）
+  → ⑤ 判定"是否真正解决同一问题"
+       ├─ 有 → 结构化清单 + 询问 a/b ──→ 交回主模型
+       └─ 无 → 静默结束 ─────────────→ 交回主模型
+  → 任何一环失败 → degraded 出声（绝不假装"查过了没有"）
+```
+
+### 5.4 结构化清单格式（有相关时）
+
+必含字段（用户要求）：**项目名称 / 核心功能 / 可复用点 / 与本方案的差异 / 潜在风险**。附加证据字段：stars、最后提交、license、archived、链接。
+
+```markdown
+### 开源先例：<一句话需求>
+
+| 项目 | 核心功能 | 可复用点 | 与本方案的差异 | 潜在风险 | 证据 |
+|---|---|---|---|---|---|
+| owner/name | ... | ... | ... | ... | 12,244★ · 2026-10-04 · MIT |
+
+**建议**：a) 沿用上面 N 个项目继续开发（可复用 X、需改造 Y） / b) 不沿用，纯自研
+请选择 a 或 b。
+```
+
+未检出相关项目时：**不输出以上任何内容**，直接继续原任务。
+
+### 5.5 扩展点
+
+| 扩展点 | 做法 | 触发条件 |
+|---|---|---|
+| 换数据层 | 用 MCP server 替换 `probe.py`，`SKILL.md` 不动（契约层与数据层已分离） | 需要远程/团队共享检索时 |
+| 提升触发确定性 | 加 DSH 插件薄壳注入常驻规则 | 仅当触发率被证明不足时（§9） |
+| 本地先例优先 | 新增一源：先查当前仓库/组织内是否已有实现 | 用户提出时 |
+| 私有源 | `probe.py` 增加 `--source gitlab\|gitea` | 有自建实例时 |
+
+---
+
+## 6. 异常处理与降级链
+
+| 情况 | 行为 |
+|---|---|
+| 限流 403/429 | 退避重试 1 次 → 仍失败：`degraded / rate-limited`，提示设置 `GITHUB_TOKEN` |
+| 存在 `GITHUB_TOKEN` | 自动使用（10 → 30 次/分钟） |
+| 网络完全不通 | `health` 阶段即发现 → `degraded / network` → 退 L2/L3 |
+| 无 Python 解释器 | 退 L2 → L3，并**明说精度下降**（硬事实不可靠） |
+| 非 ASCII 输出（控制台 GBK） | `sys.stdout.reconfigure(encoding="utf-8")` + `PYTHONIOENCODING=utf-8` |
+| 单请求超时 | 15 秒，计入预算，不重试超过 2 次 |
+| 总预算耗尽 | 用现有证据出结论，标 `degraded`，不出结论性"没有" |
+| 参数错误 | 退出码 3，`bad-args`，不静默 |
+
+**降级链**：`probe.py(GitHub API)` → `L2 宿主 HTTP 工具` → `L3 web_search` → 全不可用则 `degraded` 出声。
+
+---
+
+## 7. Stop-and-Ask 规则（用户显式要求）
+
+遇到以下情形**必须停下来问用户**，不得自行假设或跳过：
+
+1. 需求存在多种等价术语，且不同术语会显著改变检索结果，无法择优；
+2. 某候选落在"是否真正解决同一问题"的边界上，而该判断会改变 a/b 建议；
+3. ≥2 个候选都声称解决同一问题，且**推荐哪个会实质影响**用户的复用决策；
+4. 用户给的需求描述本身不足以提炼出任何技术术语（例：只给了产品名）。
+
+提问时须给出：**具体问题 + 可选项 + 我的建议**，等待确认后再继续。
+
+---
+
+## 8. 借鉴机制（用户显式要求）
+
+### 8.1 借鉴映射（写入 `references/reuse-map.md`）
+
+| 来源项目 | 借鉴的模块 | 适配改动点 |
+|---|---|---|
+| `aradar46/reuse-before-generate` | "多角度检索 + 双箱证据（可复用 / 需竞争）"的思路；"不做额外 LLM 调用"的分工原则 | **只保留 GitHub 单源**（实测多注册表是噪音）；术语由模型给，不由参数长文案规定 |
+| `skyzhao1223/wheel-hub` | `adopt / adapt / inspect / avoid` 四档判定措辞 | 融合进"可复用点 / 差异"两列，不单独打分 |
+| `rjmurillo/ai-agents` 的 `programming-advisor` | 触发语表、常见重复造轮子清单（auth / 日期 / 表单校验 / CLI 解析等） | 进 `references/triage-rubric.md` 的辅助清单，**不作主判定** |
+| `shimo4228/search-first` | `Adopt / Extend / Compose / Build` 决策矩阵、Quick/Full 双模式 | 决策矩阵进 `verdicts.md` 作 a/b 选项的措辞来源 |
+| `mnemox-ai/idea-reality-mcp` | `duplicate_likelihood` 字段语义（"是否已被做过"） | 只借语义，**不借评分**；其"Product Hunt 源无效"的教训直接采纳（不接 PH） |
+
+### 8.2 本 skill 自身也遵守同一流程
+
+开发 wheel-check 时执行同一动作：先查、有则结构化呈现并询问 a/b、无则静默继续。**RED 阶段的基线运行即为它的第一次真实自检**（见 `evals/results-RED.md`）。
+
+---
+
+## 9. 风险与已知限制
+
+| 风险 | 说明 | 缓解 |
+|---|---|---|
+| **强过滤导致漏检** | 实测 `incremental test selection` 强过滤后 `total=0`，而正确答案存在 | §5.3 的三级降过滤重试；宁可多查一层，不可该找到却没找到 |
+| **精度是真正的难点** | 检索是几天的事，精度是几个月的事；实测 top 5 内仍有假阳性（`GarminDB`） | triage-rubric 显式判定 + 静默契约 + 用例集驱动迭代 |
+| **触发是概率性的** | skill 靠 description 让宿主自行决定是否加载，做不到 100% | description 迭代 + RED/GREEN 实测触发；必要时加插件层 |
+| **语义鸿沟** | 提示词词汇 ≠ 仓库词汇（"改完文件只跑受影响的测试" vs test impact analysis） | 去品牌化 + 术语扩展（§5.3②）；中文必须先转英文检索式 |
+| **"想法已作为大产品的一个功能存在"** | 找不到对应仓库 | 明确列为已知限制，不假装能解决 |
+| **GitHub 限流** | 未认证 10 次/分钟 | 每层一次查询 + 退避 + `GITHUB_TOKEN` 指引 |
+| **平台吸收风险** | 主流 agent 均已有 web search，但**无人内建"动手前查先例 + 静默跳过"的行为** | 只做该行为差异；接受未来可能被吸收 |
+| **同名不同功能** | `prior art` 关键词大量命中**专利**检索工具 | triage-rubric 明确排除专利/代码抄袭类 |
+
+---
+
+## 10. 验证方案
+
+### 10.1 TDD（writing-skills 的 Iron Law）
+
+| 阶段 | 动作 | 证据 |
+|---|---|---|
+| **RED** | 派**干净 subagent**（无 skill）执行 8 个真实场景提示，记录其自然行为 | `evals/results-RED.md`（含原话摘录） |
+| **GREEN** | 把 skill 软链进 `~/.dsh/skills/`，同一批提示再跑一遍 | `evals/results-GREEN.md` |
+| **REFACTOR** | 提取新的规避话术 → 补入 SKILL.md 的反规避条目 → 重跑 | 结果文件追加 |
+
+场景覆盖：4 个"有明确先例"（应出声并问 a/b）+ 2 个"故意无先例"（应静默）+ 1 个"不适用"（改 bug，应完全不触发）+ 1 个"失败路径"（断网/坏参数，应出声）。
+
+### 10.2 指标（本次人工记录，自动化留待后续）
+
+| 指标 | 定义 |
+|---|---|
+| 静默正确率 | 无对应项目的用例中，正确地什么都没说的比例（**本项目最关键的指标**） |
+| 假阳性率 | 清单中"其实不解决同一问题"的条目占比 |
+| 出声正确率 | 失败路径中正确报告失败（而非静默）的比例 |
+| 触发正确率 | 该触发的触发、不该触发的不触发 |
+
+---
+
+## 11. 里程碑与验收
+
+| 阶段 | 产出 | 验收标准 |
+|---|---|---|
+| **M1** | `probe.py`（health / search / repo） | 对 3 个已知查询返回正确硬事实；限流时正确返回 `degraded`；非 ASCII 输出不崩 |
+| **M2** | `SKILL.md` + `references/`（4 个文件） | RED/GREEN 两轮结果文件齐备；静默正确率 100%；出声正确率 100% |
+| **M3** | `evals/cases.jsonl` + 结果记录 | 用例集 ≥10 条，含 ≥2 条假需求 |
+| **M4** | `README.md`（双语）+ `LICENSE` + 安装说明 | 陌生人可从零装上；`skills/wheel-check/` 拷进任意宿主 skill 目录即可用 |
+
+---
+
+## 12. 术语与决策记录
+
+| 决策 | 结论 | 依据 |
+|---|---|---|
+| 命名 | `wheel-check` | 与既有 `wheel-hub` 同语汇，GitHub 无同名 skill；`prior-art` 撞名且语义偏专利 |
+| 仓库位置 | 独立 git 仓库（本机路径不入库） | 用户选定；可迁移可分发 |
+| 安装方式 | 拷贝/软链 `skills/wheel-check/` 到宿主 skill 目录 | 零安装摩擦；DSH 侧用目录联接做实测 |
+| 数据层语言 | Python（纯 stdlib） | 本机实测：curl 坏、Node 抖动、Python 稳定；三平台普遍自带 |
+| 检索源 | 仅 GitHub 仓库搜索（主力）+ 精确包名（可选）+ 可选富化 | 实测多注册表为噪音 |
+| 分档 | 二分：相关则问 a/b，不相关则静默 | 用户本次指令；旧草案的弱/中/强三档已弃用 |
+| 失败处理 | `degraded` 必须出声 | 旧草案的关键洞见：现有同类工具把"没搜到"与"没搜成"混为一谈 |
