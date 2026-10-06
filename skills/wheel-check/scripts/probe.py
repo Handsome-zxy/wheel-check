@@ -46,13 +46,17 @@ def urlopen_json(url, headers=None, timeout=15):
         return json.load(r)
 
 def build_query(terms, suffix):
-    """Merge every term into a single OR query so one tier costs one request.
+    """Plain space-joined concept nouns (GitHub ANDs them) plus the tier suffix.
 
-    Unauthenticated GitHub search allows only 10 requests/minute, so one request
-    per term is not affordable.
+    One request per tier: unauthenticated GitHub search allows only 10/minute, so
+    every term is folded into a single query instead of one request per term.
+
+    Deliberately unquoted and unparenthesised (measured live): quoting forces an
+    exact-phrase match and cut recall 11 -> 1 for one concept noun, and a
+    parenthesised OR is not honoured as a boolean grouping at all (11108 noise
+    hits). Callers must send concept nouns, never long phrases.
     """
-    quoted = " OR ".join('"%s"' % t for t in terms)
-    return ("(%s)" % quoted if len(terms) > 1 else quoted) + suffix
+    return " ".join(terms) + suffix
 
 def normalize_repo(item):
     """Reduce a GitHub repo payload to the hard facts the caller may render."""
@@ -121,10 +125,13 @@ def main(argv=None):
         return e.code if isinstance(e.code, int) else EXIT_BAD_ARGS
     if args.cmd == "search":
         try:
-            validate_terms(args.terms)
+            terms = validate_terms(args.terms)
         except ValueError as e:
             print("error: %s" % e, file=sys.stderr)
             return EXIT_BAD_ARGS
+        # Hand the search path the CLEANED list: raw `--terms " a |  | b | "` must
+        # never reach build_query with empty groups or surrounding whitespace.
+        args.terms = terms
     return EXIT_OK
 
 if __name__ == "__main__":

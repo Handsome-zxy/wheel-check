@@ -40,6 +40,30 @@ class TestCliBadArgs(unittest.TestCase):
         p = load_probe()
         self.assertEqual(p.main(["search", "--terms", "x", "--source", "nope"]), 3)
 
+class TestMainSearchTerms(unittest.TestCase):
+    """Task 2 review minor: main() must not discard validate_terms()'s cleaned list.
+
+    Raw `--terms " a |  | b | "` must never reach the query builder: empty groups and
+    surrounding whitespace have to be gone by the time the search path reads them.
+    """
+
+    def test_main_replaces_raw_terms_with_the_cleaned_list(self):
+        p = load_probe()
+        ns = p.build_parser().parse_args(["search", "--terms", " a |  | b | "])
+        self.assertEqual(ns.terms, " a |  | b | ")  # argparse hands over the raw string
+
+        class StubParser(object):
+            def parse_args(self, argv):
+                return ns
+
+        p.build_parser = lambda: StubParser()  # fresh module per test; no leakage
+        self.assertEqual(p.main([]), 0)
+        self.assertEqual(ns.terms, ["a", "b"])
+
+    def test_whitespace_padded_terms_still_exit_ok_on_the_real_cli(self):
+        p = load_probe()
+        self.assertEqual(p.main(["search", "--terms", " a |  | b | "]), 0)
+
 FAKE_REPO = {
     "full_name": "Tinder/bazel-diff", "html_url": "https://github.com/Tinder/bazel-diff",
     "stargazers_count": 526, "pushed_at": "2026-10-06T04:00:00Z",
@@ -103,18 +127,31 @@ class TestTierDefinitions(unittest.TestCase):
         self.assertLessEqual(abs((date.today() - date.fromisoformat(m.group(1))).days - 540), 1)
 
 class TestBuildQuery(unittest.TestCase):
-    def test_multiple_terms_become_one_parenthesized_or(self):
+    """Contract (controller ruling): plain terms, space-joined. No quotes, no parens.
+
+    Quoting a concept noun forced an exact-phrase match (measured 11 -> 1 hits);
+    a parenthesised OR is not honoured by GitHub (measured 11108 noise hits).
+    """
+
+    def test_multiple_terms_are_space_joined_as_plain_terms(self):
         p = load_probe()
         self.assertEqual(p.build_query(["test selection", "affected tests"], " stars:>50"),
-                         '("test selection" OR "affected tests") stars:>50')
+                         "test selection affected tests stars:>50")
 
-    def test_single_term_is_not_parenthesized(self):
+    def test_single_term_passes_through_unquoted(self):
         p = load_probe()
-        self.assertEqual(p.build_query(["test selection"], ""), '"test selection"')
+        self.assertEqual(p.build_query(["test selection"], ""), "test selection")
+
+    def test_never_emits_quotes_or_parentheses(self):
+        p = load_probe()
+        for terms in (["a"], ["a", "b"], ["test selection", "affected tests", "impacted tests"]):
+            q = p.build_query(terms, " stars:>50")
+            for ch in ('"', "'", "(", ")"):
+                self.assertNotIn(ch, q, "quotes/parens change GitHub's query semantics: %r" % q)
 
     def test_build_query_appends_the_tier_suffix_verbatim(self):
         p = load_probe()
-        self.assertEqual(p.build_query(["a"], " fork:false"), '"a" fork:false')
+        self.assertEqual(p.build_query(["a"], " fork:false"), "a fork:false")
 
 class TestNormalizeRepo(unittest.TestCase):
     def test_normalizes_hard_facts_to_a_kind_repo_entry(self):
@@ -151,10 +188,11 @@ class TestGithubRequestBudget(unittest.TestCase):
             calls.append(url)
             return {"total_count": 1, "items": [FAKE_REPO]}
         p.github_search(["test selection", "affected tests", "impacted tests"], 8, fetch=fetch)
-        self.assertEqual(len(calls), 1, "terms must merge into one OR query, not one request each")
+        self.assertEqual(len(calls), 1,
+                         "terms must merge into one query, not one request each (quota 10/min)")
         q = urllib.parse.parse_qs(urllib.parse.urlparse(calls[0]).query)["q"][0]
-        for term in ("test selection", "affected tests", "impacted tests"):
-            self.assertIn('"%s"' % term, q)
+        self.assertIn("test selection affected tests impacted tests", q)
+        self.assertNotIn('"', q)
 
     def test_three_terms_exhaust_three_tiers_in_three_requests(self):
         p = load_probe()
