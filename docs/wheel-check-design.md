@@ -257,7 +257,7 @@ probe.py package --registry npm --name chokidar   # 精确包名查询（非关�
 
 ### 5.4 结构化清单格式（有相关时）
 
-必含字段（用户要求）：**项目名称 / 核心功能 / 可复用点 / 与本方案的差异 / 潜在风险**。附加证据字段：stars、最后提交、license、archived、链接。
+必含字段（用户要求）：**项目名称 / 核心功能 / 可复用点 / 与本方案的差异 / 潜在风险**。附加证据字段：stars、最后一次推送（`pushed_at`——最后一次 **push**，不是最后一次提交）、license、archived、链接。
 
 ```markdown
 ### 开源先例：<一句话需求>

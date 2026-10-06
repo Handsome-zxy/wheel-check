@@ -2,6 +2,13 @@
 import contextlib, importlib.util, io, json, os, pathlib, re, socket, sys, unittest, unittest.mock, urllib.error, urllib.parse
 from datetime import date
 
+# Never let the suite cache bytecode next to the skill payload. `load_probe()` execs
+# skills/wheel-check/scripts/probe.py, and importlib's source loader writes
+# `scripts/__pycache__/probe.cpython-*.pyc` on the way in — which then sits inside the very
+# directory the README tells people to `cp -R` into their host. `.gitignore` keeps the cache
+# out of git; only this keeps it out of the payload, on every run.
+sys.dont_write_bytecode = True
+
 PROBE = pathlib.Path(__file__).resolve().parents[1] / "skills" / "wheel-check" / "scripts" / "probe.py"
 
 def load_probe():
