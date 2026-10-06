@@ -2,6 +2,7 @@
 """wheel-check data layer: GitHub / HN / HuggingFace retrieval. Hard facts only."""
 import argparse
 import json
+import os
 import socket
 import sys
 import time
@@ -18,6 +19,44 @@ RETRY_BACKOFF = 1.0   # seconds between the original request and its one retry (
 RETRY_BUDGET = 1      # retries allowed for a WHOLE search: 3 tier requests + 1 retry
 
 UA = {"User-Agent": "wheel-check", "Accept": "application/vnd.github+json"}
+
+GITHUB_HOST = "api.github.com"                    # the ONE host a token may travel to
+GITHUB_API = "https://" + GITHUB_HOST
+GITHUB_TOKEN_ENV = ("GITHUB_TOKEN", "GH_TOKEN")   # GH_TOKEN is the name the gh CLI uses
+
+def github_token(environ=None):
+    """The GitHub credential from the environment, or None when none is set (§6).
+
+    `GITHUB_TOKEN` first, then `GH_TOKEN`: the second is the name the gh CLI already
+    exports, so an authenticated shell works without exporting anything twice. A blank
+    value counts as absent. The value is never logged, echoed, or put in a URL —
+    `request_headers` is its only reader and all it does is add one request header.
+    """
+    env = os.environ if environ is None else environ
+    for name in GITHUB_TOKEN_ENV:
+        value = (env.get(name) or "").strip()
+        if value:
+            return value
+    return None
+
+def _is_github_api(url):
+    """True only for an api.github.com URL — an exact host compare, not a prefix test."""
+    return urllib.parse.urlsplit(url).netloc.lower() == GITHUB_HOST
+
+def request_headers(url, environ=None):
+    """Headers for one GET: the UA, plus GitHub's bearer token when we have one (§6).
+
+    Unauthenticated GitHub search allows 10 requests/minute and 30 with a token (§2.3).
+    The credential is OPTIONAL — without one this returns exactly the headers this file
+    has always sent — and it goes to `api.github.com` requests ONLY: Algolia and the
+    Hugging Face Hub are keyless third parties, and a GitHub credential has no business
+    travelling to them (§5.5 keeps the sources apart).
+    """
+    headers = dict(UA)
+    token = github_token(environ)
+    if token and _is_github_api(url):
+        headers["Authorization"] = "Bearer " + token
+    return headers
 
 def force_utf8():
     for stream in (sys.stdout, sys.stderr):
@@ -46,8 +85,13 @@ def github_tiers():
     ]
 
 def urlopen_json(url, headers=None, timeout=15):
-    """Default `fetch`: one GET, JSON body. Callers may inject their own."""
-    req = urllib.request.Request(url, headers=headers or UA)
+    """Default `fetch`: one GET, JSON body. Callers may inject their own.
+
+    `headers=None` means this file's own headers, which carry `GITHUB_TOKEN` when the
+    environment sets one (see `request_headers`). A caller passing its own headers owns
+    the request completely, credential included.
+    """
+    req = urllib.request.Request(url, headers=headers or request_headers(url))
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
@@ -308,8 +352,6 @@ def github_search(terms, limit, fetch=urlopen_json, strict_only=False):
             return {"tier": tier, "total": data.get("total_count", 0),
                     "results": [normalize_repo(i) for i in items]}
     return {"tier": "none", "total": 0, "results": []}
-
-GITHUB_API = "https://api.github.com"
 
 def _repo_page(data):
     """Read one /repos/{owner}/{repo} body, or refuse to read it as a repository.
@@ -698,8 +740,9 @@ def _health_entry(name, url, fetch):
             quota = github_quota(body)
             entry = {"source": name, "status": "ok", "quota": quota,
                      # The API's own limit IS the observed auth state (10 anonymous, 30
-                     # with a token); labelling it from GITHUB_TOKEN would describe what
-                     # the environment claims rather than what this process sent.
+                     # with a token). `request_headers` really does attach GITHUB_TOKEN to
+                     # this request, so the reported limit describes what was SENT rather
+                     # than what the environment claims.
                      "auth": ("token" if quota["search"]["limit"] > GITHUB_ANON_SEARCH_LIMIT
                               else "anonymous")}
         else:

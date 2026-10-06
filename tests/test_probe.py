@@ -1,5 +1,5 @@
 # tests/test_probe.py
-import contextlib, importlib.util, io, json, pathlib, re, socket, sys, unittest, unittest.mock, urllib.error, urllib.parse
+import contextlib, importlib.util, io, json, os, pathlib, re, socket, sys, unittest, unittest.mock, urllib.error, urllib.parse
 from datetime import date
 
 PROBE = pathlib.Path(__file__).resolve().parents[1] / "skills" / "wheel-check" / "scripts" / "probe.py"
@@ -416,6 +416,119 @@ class TestUrlopenJson(unittest.TestCase):
         self.assertEqual(seen["timeout"], 15)
         self.assertEqual(seen["ua"], "wheel-check")
         self.assertEqual(seen["accept"], "application/vnd.github+json")
+
+class TestGithubToken(unittest.TestCase):
+    """Spec §6's `存在 GITHUB_TOKEN | 自动使用（10 → 30 次/分钟）` row.
+
+    The token is optional (absent changes nothing), it may travel to api.github.com
+    only — Algolia and the Hub are keyless third parties — and it must never be
+    printed: a credential in a diagnostic is a leaked credential.
+    """
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    TOKEN = "FAKE-TOKEN-SENTINEL"
+    SEARCH_URL = "https://api.github.com/search/repositories?q=x"
+
+    def _captured(self, p, urls, environ, body=b"{}"):
+        """urlopen_json() each url; return {url: authorization header value or None}."""
+        seen = {}
+        def fake_urlopen(req, timeout=None):
+            sent = {k.lower(): v for k, v in req.header_items()}
+            seen[req.full_url] = sent.get("authorization")
+            return self._Resp(body)
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", fake_urlopen), \
+                unittest.mock.patch.dict(os.environ, environ):
+            for url in urls:
+                p.urlopen_json(url)
+        return seen
+
+    def test_the_github_token_is_sent_as_a_bearer_header(self):
+        p = load_probe()
+        seen = self._captured(p, [self.SEARCH_URL], {"GITHUB_TOKEN": self.TOKEN})
+        self.assertEqual(seen[self.SEARCH_URL], "Bearer " + self.TOKEN)
+
+    def test_gh_token_is_the_fallback_when_github_token_is_unset(self):
+        p = load_probe()
+        seen = self._captured(p, [p.GITHUB_RATE_LIMIT],
+                              {"GITHUB_TOKEN": "", "GH_TOKEN": self.TOKEN})
+        self.assertEqual(seen[p.GITHUB_RATE_LIMIT], "Bearer " + self.TOKEN)
+
+    def test_github_token_wins_over_gh_token(self):
+        p = load_probe()
+        url = p.GITHUB_API + "/repos/o/n"
+        seen = self._captured(p, [url], {"GITHUB_TOKEN": "primary", "GH_TOKEN": "fallback"})
+        self.assertEqual(seen[url], "Bearer primary")
+
+    def test_no_token_sends_no_authorization_header_and_never_crashes(self):
+        p = load_probe()
+        seen = self._captured(p, [self.SEARCH_URL], {"GITHUB_TOKEN": "", "GH_TOKEN": ""})
+        self.assertIsNone(seen[self.SEARCH_URL])
+        # A blank value is absent, not a token made of whitespace.
+        self.assertIsNone(p.github_token({"GITHUB_TOKEN": "   ", "GH_TOKEN": ""}))
+        self.assertIsNone(p.github_token({}))
+
+    def test_the_token_is_never_attached_to_the_hn_or_hf_endpoints(self):
+        p = load_probe()
+        hn, hf = p._hn_url(["test selection"], 3), p._hf_url(["speech"], 3)
+        seen = self._captured(p, [self.SEARCH_URL, p.GITHUB_RATE_LIMIT, hn, hf],
+                              {"GITHUB_TOKEN": self.TOKEN})
+        self.assertEqual(seen[self.SEARCH_URL], "Bearer " + self.TOKEN)
+        self.assertEqual(seen[p.GITHUB_RATE_LIMIT], "Bearer " + self.TOKEN,
+                         "health's GitHub leg is a GitHub request too")
+        self.assertIsNone(seen[hn], "Algolia is keyless: it must not see a GitHub credential")
+        self.assertIsNone(seen[hf], "the Hub is keyless: it must not see a GitHub credential")
+
+    def test_a_real_search_carries_the_token_on_the_github_legs_only(self):
+        # End-to-end through main()'s own fetch: the header choice is proven for the URLs
+        # the pipeline really builds, including the two supplements.
+        p = load_probe()
+        seen = {}
+        def fake_urlopen(req, timeout=None):
+            sent = {k.lower(): v for k, v in req.header_items()}
+            seen[req.full_url] = sent.get("authorization")
+            if "hn.algolia.com" in req.full_url:
+                return self._Resp(b'{"hits": [], "nbHits": 0}')
+            if "huggingface.co" in req.full_url:
+                return self._Resp(b"[]")
+            return self._Resp(b'{"total_count": 0, "items": []}')
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", fake_urlopen), \
+                unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": self.TOKEN}):
+            code, env = p.search_envelope(["speech"], fetch=p.urlopen_json)
+        self.assertEqual(code, p.EXIT_OK)
+        self.assertEqual([s["source"] for s in env["sources"]], ["github", "hn", "hf"])
+        github = [u for u in seen if "api.github.com" in u]
+        others = [u for u in seen if "api.github.com" not in u]
+        self.assertTrue(github, "the GitHub leg must really have run")
+        self.assertTrue(others, "the supplements must really have run")
+        self.assertTrue(all(seen[u] == "Bearer " + self.TOKEN for u in github))
+        self.assertTrue(all(seen[u] is None for u in others))
+
+    def test_the_token_never_reaches_stdout_or_stderr(self):
+        # 403 is the quota path (retried, then spoken as rate-limited); 401 is the bad-token
+        # path, which prints the exception type on stderr — the one diagnostic that could
+        # quote a request. Neither may contain the token.
+        p = load_probe()
+        for status in (403, 401):
+            def fake_urlopen(req, timeout=None, status=status):
+                raise urllib.error.HTTPError(req.full_url, status, "nope", {}, None)
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.object(p.urllib.request, "urlopen", fake_urlopen), \
+                    unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": self.TOKEN}), \
+                    unittest.mock.patch.object(p.time, "sleep", lambda seconds: None), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = p.main(["search", "--terms", "test selection"])
+            self.assertEqual(code, p.EXIT_DEGRADED, "HTTP %d still degrades" % status)
+            self.assertNotIn(self.TOKEN, out.getvalue())
+            self.assertNotIn(self.TOKEN, err.getvalue())
+            if status == 401:
+                self.assertNotEqual(err.getvalue(), "",
+                                    "the 401 path is the printing one, so the check is real")
 
 class TestDegraded(unittest.TestCase):
     """Review Focus #4: a rate-limited search must never be reported as an empty one.
