@@ -1,5 +1,5 @@
 # tests/test_probe.py
-import importlib.util, io, pathlib, re, unittest, unittest.mock, urllib.parse
+import contextlib, importlib.util, io, pathlib, re, sys, unittest, unittest.mock, urllib.parse
 from datetime import date
 
 PROBE = pathlib.Path(__file__).resolve().parents[1] / "skills" / "wheel-check" / "scripts" / "probe.py"
@@ -31,14 +31,55 @@ class TestValidateTerms(unittest.TestCase):
         with self.assertRaises(ValueError):
             p.validate_terms("|  |")
 
-class TestCliBadArgs(unittest.TestCase):
-    def test_empty_terms_exits_3(self):
+class TestForceUtf8(unittest.TestCase):
+    """Review Focus #3: a GBK console must not corrupt UTF-8 output.
+
+    force_utf8() is the only thing standing between a Windows GBK console and
+    mojibake, so the byte-level contract is asserted here rather than by hand.
+    """
+
+    def test_stdout_emits_utf8_bytes_even_when_the_stream_started_as_gbk(self):
         p = load_probe()
-        self.assertEqual(p.main(["search", "--terms", ""]), 3)
+        buf = io.BytesIO()
+        # newline="\n" keeps the expectation independent of os.linesep.
+        fake = io.TextIOWrapper(buf, encoding="gbk", newline="\n")
+        real_stdout, real_stderr = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = fake
+        try:
+            p.force_utf8()
+            print("测试")
+            fake.flush()
+        finally:
+            sys.stdout, sys.stderr = real_stdout, real_stderr
+        self.assertEqual(buf.getvalue(), "测试\n".encode("utf-8"))
+
+class TestCliBadArgs(unittest.TestCase):
+    """Review Focus #1: a bad call exits 3, explains itself on stderr, prints no stdout."""
+
+    def _run(self, argv):
+        p = load_probe()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = p.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_empty_terms_exits_3(self):
+        code, out, err = self._run(["search", "--terms", ""])
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "", "bad args must not print a results envelope on stdout")
+        self.assertIn("error", err)
 
     def test_bad_source_exits_3(self):
-        p = load_probe()
-        self.assertEqual(p.main(["search", "--terms", "x", "--source", "nope"]), 3)
+        code, out, err = self._run(["search", "--terms", "x", "--source", "nope"])
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")
+        self.assertIn("error", err)
+
+    def test_help_exits_0(self):
+        code, out, err = self._run(["-h"])
+        self.assertEqual(code, 0)
+        self.assertIn("usage", out)
+        self.assertEqual(err, "")
 
 class TestMainSearchTerms(unittest.TestCase):
     """Task 2 review minor: main() must not discard validate_terms()'s cleaned list.
