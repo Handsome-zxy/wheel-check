@@ -2,6 +2,7 @@
 """wheel-check data layer: GitHub / HN / HuggingFace retrieval. Hard facts only."""
 import argparse
 import json
+import socket
 import sys
 import time
 import urllib.error
@@ -54,22 +55,45 @@ class RateLimited(Exception):
     """403/429: the GitHub quota is exhausted (unauthenticated: 10 requests/minute)."""
 
 class Timeout(Exception):
-    """Any other failure that stopped the request: timeout, 5xx, DNS, bad body."""
+    """A request that ran out of time: socket timeout, or an HTTP timeout response."""
+
+class NetworkError(Exception):
+    """The request never got through: DNS, refused/reset connection, proxy, no route."""
+
+def _is_timeout(exc):
+    """True for a genuine timeout, in either the 3.8 or the 3.10+ spelling."""
+    return isinstance(exc, (socket.timeout, TimeoutError))
 
 def _classify(exc):
-    """Map a fetch failure onto the two degraded reasons the envelope can carry.
+    """Map a fetch failure onto the reason vocabulary §4.3 / §6 defines.
+
+    403/429 -> rate-limited, a dead network -> network, a request that timed out ->
+    timeout. `timeout` and `network` are kept apart deliberately: §6 gives them
+    different remedies, so telling the user "timeout" when DNS never resolved would
+    point them at the wrong fix.
 
     Our own exception types pass straight through: an injected `fetch` (tests, future
-    sources) raises RateLimited/Timeout directly, and re-classifying those would turn
-    a quota error into a generic Timeout and silently lose the retry.
+    sources) raises them directly, and re-classifying those would turn a quota error
+    into a generic Timeout and silently lose the retry.
     """
-    if isinstance(exc, (RateLimited, Timeout)):
+    if isinstance(exc, (RateLimited, Timeout, NetworkError)):
         return exc
-    if isinstance(exc, urllib.error.HTTPError):
+    if isinstance(exc, urllib.error.HTTPError):     # also a URLError: check first
         if exc.code in (403, 429):
             return RateLimited(str(exc.code))
         return Timeout("http-%s" % exc.code)
-    return Timeout(type(exc).__name__)
+    if isinstance(exc, urllib.error.URLError):
+        # urlopen wraps socket-level failures in URLError. A wrapped socket.timeout
+        # is what the 15s request timeout looks like; anything else (gaierror,
+        # refused, reset, proxy) never reached the server at all.
+        if _is_timeout(getattr(exc, "reason", None)):
+            return Timeout("socket-timeout")
+        return NetworkError(str(getattr(exc, "reason", None) or exc))
+    if _is_timeout(exc):
+        return Timeout(type(exc).__name__)
+    if isinstance(exc, OSError):                    # bare socket/SSL failure
+        return NetworkError(type(exc).__name__)
+    return Timeout(type(exc).__name__)              # no other reason exists in §4.3
 
 def _with_retry(fn, attempts=2, backoff=RETRY_BACKOFF):
     """Call fn(); on a rate limit sleep `backoff` and try again, then re-raise.
@@ -173,6 +197,15 @@ def github_search(terms, limit, fetch=urlopen_json, strict_only=False):
                     "results": [normalize_repo(i) for i in items]}
     return {"tier": "none", "total": 0, "results": []}
 
+def _degraded_reason(problem):
+    """Map a classified failure onto the §4.3 `reason` vocabulary."""
+    for exc_type, reason in ((RateLimited, "rate-limited"),
+                             (NetworkError, "network"),
+                             (Timeout, "timeout")):
+        if isinstance(problem, exc_type):
+            return reason
+    return "timeout"        # _classify only ever returns the three above
+
 def _degraded(reason):
     """Whole-operation failure. `reason` is reserved for this, never per-source.
 
@@ -203,12 +236,10 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
         gh = github_search(terms, limit, fetch=retrying, strict_only=strict_only)
     except Exception as exc:        # noqa: BLE001 - any retrieval failure degrades
         # Classify whatever came out of the retrieval: our own types pass through,
-        # everything else (5xx, dead socket, unreadable body) becomes `timeout`. A
-        # body we could not read must degrade — reporting it as `ok` + `[]` would be
-        # the one lie this contract forbids.
-        problem = _classify(exc)
-        return EXIT_DEGRADED, _degraded(
-            "rate-limited" if isinstance(problem, RateLimited) else "timeout")
+        # everything else (5xx, dead socket, unreadable body) becomes `timeout` or
+        # `network`. A body we could not read must degrade — reporting it as `ok` +
+        # `[]` would be the one lie this contract forbids.
+        return EXIT_DEGRADED, _degraded(_degraded_reason(_classify(exc)))
     return EXIT_OK, {"status": "ok", "reason": None,
                      "sources": [{"source": "github", "tier": gh["tier"],
                                   "total": gh["total"], "status": "ok"}],

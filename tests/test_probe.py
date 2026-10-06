@@ -1,5 +1,5 @@
 # tests/test_probe.py
-import contextlib, importlib.util, io, json, pathlib, re, sys, unittest, unittest.mock, urllib.error, urllib.parse
+import contextlib, importlib.util, io, json, pathlib, re, socket, sys, unittest, unittest.mock, urllib.error, urllib.parse
 from datetime import date
 
 PROBE = pathlib.Path(__file__).resolve().parents[1] / "skills" / "wheel-check" / "scripts" / "probe.py"
@@ -542,8 +542,8 @@ class TestFetchFailureClassification(unittest.TestCase):
         self.assertEqual(len(calls), 1, "only 403/429 are quota errors worth a retry")
 
     def test_network_error_degrades_instead_of_looking_empty(self):
-        # Spec 4.3 also lists a `network` reason; the brief's _classify folds every
-        # non-quota failure into `timeout`, so that is what is pinned here.
+        # §4.3 keeps `timeout` and `network` apart, and §6 gives them different
+        # remedies, so a connection failure must not be reported as a timeout.
         p = load_probe()
         def fetch(url, **kw):
             raise urllib.error.URLError("no route to host")
@@ -551,7 +551,44 @@ class TestFetchFailureClassification(unittest.TestCase):
         self.assertEqual(code, p.EXIT_DEGRADED)
         self.assertEqual(env["status"], "degraded")
         self.assertEqual(env["results"], [])
-        self.assertIsNotNone(env["reason"])
+        self.assertEqual(env["reason"], "network")
+
+    def test_dns_failure_is_network(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            raise socket.gaierror(11001, "getaddrinfo failed")
+        code, env = p.search_envelope(["x"], source="github", fetch=fetch)
+        self.assertEqual((code, env["reason"]), (p.EXIT_DEGRADED, "network"))
+
+    def test_urlerror_wrapping_a_socket_timeout_is_a_timeout(self):
+        # This is what urlopen actually raises when the 15s request timeout fires:
+        # URLError whose `reason` is the socket timeout, not a connection failure.
+        p = load_probe()
+        def fetch(url, **kw):
+            raise urllib.error.URLError(socket.timeout("timed out"))
+        code, env = p.search_envelope(["x"], source="github", fetch=fetch)
+        self.assertEqual((code, env["reason"]), (p.EXIT_DEGRADED, "timeout"))
+
+    def test_bare_socket_timeout_is_a_timeout(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            raise socket.timeout("timed out")
+        code, env = p.search_envelope(["x"], source="github", fetch=fetch)
+        self.assertEqual((code, env["reason"]), (p.EXIT_DEGRADED, "timeout"))
+
+    def test_http_504_gateway_timeout_is_a_timeout(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            raise self._http_error(504)
+        code, env = p.search_envelope(["x"], source="github", fetch=fetch)
+        self.assertEqual((code, env["reason"]), (p.EXIT_DEGRADED, "timeout"))
+
+    def test_our_own_network_error_passes_straight_through(self):
+        p = load_probe()
+        def fetch(url, **kw):
+            raise p.NetworkError("proxy refused")
+        code, env = p.search_envelope(["x"], source="github", fetch=fetch)
+        self.assertEqual((code, env["reason"]), (p.EXIT_DEGRADED, "network"))
 
     def test_a_malformed_body_degrades_instead_of_crashing(self):
         p = load_probe()
@@ -722,8 +759,8 @@ class TestMainEndToEnd(unittest.TestCase):
         code, out, _ = self._run(urlopen)
         self.assertEqual(code, 2)
         env = json.loads(out)
-        self.assertEqual((env["status"], env["results"]), ("degraded", []))
-        self.assertIsNotNone(env["reason"])
+        self.assertEqual((env["status"], env["reason"], env["results"]),
+                         ("degraded", "network", []))
 
     def test_an_unreadable_body_is_degraded_not_ok_empty(self):
         def urlopen(req, timeout=None):
