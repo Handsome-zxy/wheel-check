@@ -14,5 +14,30 @@ class TestContract(unittest.TestCase):
         p = load_probe()
         self.assertEqual((p.EXIT_OK, p.EXIT_DEGRADED, p.EXIT_BAD_ARGS), (0, 2, 3))
 
+class TestValidateTerms(unittest.TestCase):
+    def test_splits_and_strips_pipe_separated_terms(self):
+        p = load_probe()
+        self.assertEqual(p.validate_terms("test selection| affected tests "),
+                         ["test selection", "affected tests"])
+
+    def test_empty_string_raises(self):
+        p = load_probe()
+        with self.assertRaises(ValueError):
+            p.validate_terms("")
+
+    def test_only_separators_raises(self):
+        p = load_probe()
+        with self.assertRaises(ValueError):
+            p.validate_terms("|  |")
+
+class TestCliBadArgs(unittest.TestCase):
+    def test_empty_terms_exits_3(self):
+        p = load_probe()
+        self.assertEqual(p.main(["search", "--terms", ""]), 3)
+
+    def test_bad_source_exits_3(self):
+        p = load_probe()
+        self.assertEqual(p.main(["search", "--terms", "x", "--source", "nope"]), 3)
+
 if __name__ == "__main__":
     unittest.main()
