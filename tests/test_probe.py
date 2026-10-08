@@ -1,5 +1,5 @@
 # tests/test_probe.py
-import contextlib, http.server, importlib.util, io, json, os, pathlib, re, socket, sys, threading, unittest, unittest.mock, urllib.error, urllib.parse
+import contextlib, http.server, importlib.util, io, json, os, pathlib, re, socket, sys, threading, unicodedata, unittest, unittest.mock, urllib.error, urllib.parse
 from datetime import date
 
 # Never let the suite cache bytecode next to the skill payload. `load_probe()` execs
@@ -16,6 +16,45 @@ def load_probe():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+TOKEN_ENV = ("GITHUB_TOKEN", "GH_TOKEN")   # the two names probe.github_token() reads
+_AMBIENT_TOKEN = {}
+
+def setUpModule():
+    """Take the ambient GitHub credential out of the suite's environment (review fix).
+
+    `request_headers` builds the `Authorization` header from the ENVIRONMENT, and `_open`
+    (item 6b) sends a credential-bearing request through the guarded opener instead of
+    `urllib.request.urlopen`. A developer who followed README §6 — `export GITHUB_TOKEN=...`
+    — therefore has every test that stubs `urlopen` silently bypassed, and those requests go
+    to api.github.com: measured with sockets blocked, the suite reported
+    `FAILED (failures=7, errors=1)` instead of the documented `OK (skipped=3)`.
+
+    "No test hits the real API" is not conditional on the developer's environment, so the
+    token is removed for the whole module and restored afterwards. A test that needs a token
+    sets it itself with `patch.dict(os.environ, ...)` — the token tests already do.
+    """
+    _AMBIENT_TOKEN.update({name: os.environ[name] for name in TOKEN_ENV if name in os.environ})
+    for name in TOKEN_ENV:
+        os.environ.pop(name, None)
+
+def tearDownModule():
+    os.environ.update(_AMBIENT_TOKEN)
+
+def open_stub(p, fake):
+    """Patch the ONE seam every request passes through: `probe._open`.
+
+    `urlopen_json` chooses between the guarded opener (a request that carries
+    `Authorization`) and plain `urllib.request.urlopen` (everything else), so a test that
+    patches only `urlopen` is bypassed as soon as something exports a token. `_open` sits
+    upstream of that choice, which makes the stub independent of the environment AND of
+    which branch would have been taken. `fake` is called as `fake(request, timeout=...)`,
+    exactly like `_open`.
+
+    The loopback redirect tests deliberately do NOT use this helper: they exercise the real
+    transport, which is the point of item 6(b).
+    """
+    return unittest.mock.patch.object(p, "_open", fake)
 
 def stub_search(p, code=0, env=None):
     """Replace the network boundary of main()'s search path; return what it received.
@@ -419,7 +458,7 @@ class TestUrlopenJson(unittest.TestCase):
             seen["accept"] = sent.get("accept")
             seen["timeout"] = timeout
             return self._Resp(b'{"total_count": 7, "items": []}')
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", fake_urlopen):
+        with open_stub(p, fake_urlopen):
             out = p.urlopen_json("https://api.github.com/search/repositories?q=x")
         self.assertEqual(out, {"total_count": 7, "items": []})
         self.assertEqual(seen["timeout"], 15)
@@ -555,31 +594,49 @@ class TestDegraded(unittest.TestCase):
     came back as `ok`/`[]` would make the skill silently skip a real precedent.
     """
 
+    def _no_real_sleep(self, p):
+        """A test must never SERVE the retry wait itself (Minor 1 of the re-review).
+
+        `search_envelope`/`repo_envelope` take an injectable sleeper precisely so the reset
+        arithmetic can be proven without waiting; these two tests predate that seam and spent
+        a real second each. The module sleeper is replaced with a tripwire, so a test that
+        falls back to it fails instead of quietly costing the suite two seconds.
+        """
+        return unittest.mock.patch.object(
+            p.time, "sleep",
+            lambda seconds: self.fail("a test asked the real time.sleep for %r" % (seconds,)))
+
     def test_rate_limited_after_retry_is_degraded(self):
         p = load_probe()
-        calls = []
+        calls, slept = [], []
         def fetch(url, **kw):
             calls.append(url)
             raise p.RateLimited("403")
-        code, env = p.search_envelope(["x"], source="github", fetch=fetch)
+        with self._no_real_sleep(p):
+            code, env = p.search_envelope(["x"], source="github", fetch=fetch,
+                                          clock=lambda: 0.0, sleep=slept.append)
         self.assertEqual(code, 2)
         self.assertEqual(env["status"], "degraded")
         self.assertEqual(env["reason"], "rate-limited")
         self.assertEqual(env["results"], [])
         self.assertEqual(len(calls), 2)   # original + 1 retry, never more
+        self.assertEqual(slept, [1.0], "the fixed backoff is recorded, never served")
 
     def test_transient_then_ok(self):
         p = load_probe()
-        state = {"n": 0}
+        state, slept = {"n": 0}, []
         def fetch(url, **kw):
             state["n"] += 1
             if state["n"] == 1:
                 raise p.RateLimited("403")
             return {"total_count": 1, "items": [FAKE_REPO]}
-        code, env = p.search_envelope(["x"], source="github", fetch=fetch)
+        with self._no_real_sleep(p):
+            code, env = p.search_envelope(["x"], source="github", fetch=fetch,
+                                          clock=lambda: 0.0, sleep=slept.append)
         self.assertEqual(code, 0)
         self.assertEqual(env["status"], "ok")
         self.assertEqual(len(env["results"]), 1)
+        self.assertEqual(slept, [1.0])
 
     def test_empty_is_ok_and_not_degraded(self):
         p = load_probe()
@@ -635,6 +692,36 @@ class TestRetryPlacement(unittest.TestCase):
         with unittest.mock.patch.object(p.time, "sleep", slept.append):
             p.search_envelope(["x"], source="github", fetch=fetch)
         self.assertEqual(slept, [1.0])   # spec 6: back off once, never busy-wait
+
+class TestBudgetArithmeticIsStatedNotImplied(unittest.TestCase):
+    """Minor 3 of the re-review: the documented wall clock must match the code.
+
+    The 45 s budget caps the WAIT, not elapsed time: one invocation can also spend up to
+    `INVOCATION_REQUEST_CEILING` request timeouts (3 tiers + 1 retry at `REQUEST_TIMEOUT`
+    each). The docs state 105 s as the hard ceiling; this pins the arithmetic, so moving any
+    of the three numbers fails here instead of leaving the docs quietly wrong.
+    """
+
+    def test_the_worst_case_wall_clock_is_the_documented_105_seconds(self):
+        p = load_probe()
+        self.assertEqual(p.INVOCATION_REQUEST_CEILING * p.REQUEST_TIMEOUT
+                         + p.SEARCH_BUDGET_SECONDS, 105.0)
+
+    def test_the_request_ceiling_is_the_tier_count_plus_the_one_retry(self):
+        p = load_probe()
+        self.assertEqual(p.INVOCATION_REQUEST_CEILING,
+                         len(p.github_tiers()) + p.RETRY_BUDGET)
+
+    def test_the_retry_wait_can_never_exceed_the_budget(self):
+        p = load_probe()
+        now = 1800000000.0
+        for distance in (0, 1, 44, 45):
+            self.assertEqual(
+                p._retry_wait(p.RateLimited("429", reset=int(now) + distance), 1.0, now),
+                float(distance))
+        self.assertIsNone(
+            p._retry_wait(p.RateLimited("429", reset=int(now) + 46), 1.0, now),
+            "beyond the budget the wait is refused, not extended")
 
 class TestResetAwareRetry(unittest.TestCase):
     """Item 6a: retry only when the wait fits the budget, and never sleep for real.
@@ -1318,7 +1405,7 @@ class TestMainHnSource(unittest.TestCase):
                 raise AssertionError("--source hn must not call GitHub: %s" % req.full_url)
             return self._Resp(json.dumps(FAKE_HN).encode("utf-8"))
         out = io.StringIO()
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
+        with open_stub(p, urlopen), \
                 contextlib.redirect_stdout(out):
             code = p.main(["search", "--terms", "incremental test selection",
                            "--source", "hn"])
@@ -1460,7 +1547,7 @@ class TestMainEndToEnd(unittest.TestCase):
     def _run(self, urlopen):
         p = load_probe()
         out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
+        with open_stub(p, urlopen), \
                 unittest.mock.patch.object(p.time, "sleep", lambda seconds: None), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = p.main(["search", "--terms", "test selection"])
@@ -1818,7 +1905,7 @@ class TestHuggingFaceSourceDispatch(unittest.TestCase):
                 raise AssertionError("--source hf must not call %s" % req.full_url)
             return _Resp(json.dumps(FAKE_HF).encode("utf-8"))
         out = io.StringIO()
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
+        with open_stub(p, urlopen), \
                 contextlib.redirect_stdout(out):
             code = p.main(["search", "--terms", "speech to text", "--source", "hf"])
         self.assertEqual(code, 0)
@@ -1938,7 +2025,7 @@ class TestRepoCommand(unittest.TestCase):
         def urlopen(req, timeout=None):
             seen.append(req.full_url)
             return _Resp(json.dumps(FAKE_REPO).encode("utf-8"))
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen):
+        with open_stub(p, urlopen):
             code, out, err = self._run(p, ["repo", "Tinder/bazel-diff"])
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
@@ -1957,7 +2044,7 @@ class TestRepoCommand(unittest.TestCase):
         p = load_probe()
         def boom(req, timeout=None):
             raise AssertionError("a malformed full_name must not query anything")
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", boom):
+        with open_stub(p, boom):
             code, out, err = self._run(p, ["repo", "not-a-full-name"])
         self.assertEqual(code, 3)
         self.assertEqual(out, "", "a bad call must not print an envelope on stdout")
@@ -1970,7 +2057,7 @@ class TestRepoCommand(unittest.TestCase):
             # If valid_full_name() ever accepted these, the call would reach api.github.com
             # and the regression would surface as a degraded exit 2 instead of a bad call.
             raise AssertionError("a malformed full_name must not query anything")
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", boom):
+        with open_stub(p, boom):
             for bad in ("a/b/c", "/name", "owner/", "", "own er/name"):
                 code, out, err = self._run(p, ["repo", bad])
                 self.assertEqual(code, 3, bad)
@@ -1998,7 +2085,7 @@ class TestRepoCommand(unittest.TestCase):
         p = load_probe()
         def urlopen(req, timeout=None):
             return _Resp(json.dumps({}).encode("utf-8"))
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen):
+        with open_stub(p, urlopen):
             code, out, err = self._run(p, ["repo", "Tinder/bazel-diff"])
         self.assertEqual(code, 2)
         env = json.loads(out)
@@ -2011,7 +2098,7 @@ class TestRepoCommand(unittest.TestCase):
         def urlopen(req, timeout=None):
             calls.append(req.full_url)
             raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen):
+        with open_stub(p, urlopen):
             code, out, err = self._run(p, ["repo", "Tinder/bazel-diff"])
         self.assertEqual(code, 2)
         env = json.loads(out)
@@ -2174,7 +2261,7 @@ class TestHealthReport(unittest.TestCase):
                 body = FAKE_HF
             return _Resp(json.dumps(body).encode("utf-8"))
         out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
+        with open_stub(p, urlopen), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = p.main(["health"])
         self.assertEqual(code, 0)
@@ -2188,7 +2275,7 @@ class TestHealthReport(unittest.TestCase):
         def urlopen(req, timeout=None):
             raise urllib.error.URLError("no route to host")
         out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", urlopen), \
+        with open_stub(p, urlopen), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = p.main(["health"])
         self.assertEqual(code, 2)
@@ -2517,13 +2604,88 @@ class TestUntrustedTextSanitization(unittest.TestCase):
     touched — URLs, numbers, counts and owner/name stay byte-for-byte what the source said.
     """
 
-    INVISIBLE = "\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff"
+    # Named from the THREAT MODEL (Trojan-Source bidi controls + invisible-text hiding),
+    # never from the filter's own ranges: these are Unicode NAMES resolved by the running
+    # interpreter, so a code point the filter forgets fails here instead of being copied
+    # into the test's expectation in lockstep with the bug (Minor 2 of the re-review).
+    HIDDEN_NAMES = (
+        "ZERO WIDTH SPACE", "ZERO WIDTH NON-JOINER", "ZERO WIDTH JOINER",
+        "LEFT-TO-RIGHT MARK", "RIGHT-TO-LEFT MARK", "ARABIC LETTER MARK",
+        "LEFT-TO-RIGHT EMBEDDING", "RIGHT-TO-LEFT EMBEDDING",
+        "POP DIRECTIONAL FORMATTING", "LEFT-TO-RIGHT OVERRIDE", "RIGHT-TO-LEFT OVERRIDE",
+        "LEFT-TO-RIGHT ISOLATE", "RIGHT-TO-LEFT ISOLATE", "FIRST STRONG ISOLATE",
+        "POP DIRECTIONAL ISOLATE", "WORD JOINER", "FUNCTION APPLICATION",
+        "INVISIBLE TIMES", "INVISIBLE SEPARATOR", "INVISIBLE PLUS",
+        "SOFT HYPHEN", "MONGOLIAN VOWEL SEPARATOR", "ZERO WIDTH NO-BREAK SPACE",
+    )
+    # Cc/Cf code points that are NOT hidden: the whitespace controls are separators (so
+    # "a\nb" stays two words), and a handful of Cf marks genuinely render a visible glyph.
+    # Those are named here too — resolving names, never copying the filter's numbers — so an
+    # over-broad filter (dropping something a reader can see) fails as loudly as a narrow one.
+    SEPARATOR_CODES = frozenset((0x09, 0x0A, 0x0B, 0x0C, 0x0D))
+    VISIBLE_FORMAT_NAMES = (
+        "ARABIC NUMBER SIGN", "ARABIC SIGN SANAH", "ARABIC FOOTNOTE MARKER",
+        "ARABIC SIGN SAFHA", "ARABIC SIGN SAMVAT", "ARABIC NUMBER MARK ABOVE",
+        "ARABIC END OF AYAH", "SYRIAC ABBREVIATION MARK",
+        "ARABIC POUND MARK ABOVE", "ARABIC PIASTRE MARK ABOVE",
+        "ARABIC DISPUTED END OF AYAH", "KAITHI NUMBER SIGN", "KAITHI NUMBER SIGN ABOVE",
+    )
 
-    def test_zero_width_and_bidi_characters_are_stripped(self):
+    def visible_format(self):
+        """Those marks by code point; a name an older Unicode version lacks is skipped."""
+        codes = set()
+        for name in self.VISIBLE_FORMAT_NAMES:
+            try:
+                codes.add(ord(unicodedata.lookup(name)))
+            except KeyError:      # e.g. U+0890/U+0891 on a Unicode 12 interpreter
+                continue
+        return codes
+
+    def hidden(self):
+        """The hidden characters above, resolved by name — never by the filter's numbers."""
+        return [unicodedata.lookup(name) for name in self.HIDDEN_NAMES]
+
+    def test_every_named_hidden_character_is_stripped(self):
         p = load_probe()
-        for ch in self.INVISIBLE:
+        for name in self.HIDDEN_NAMES:
+            ch = unicodedata.lookup(name)
+            self.assertEqual(p.sanitize_text("a" + ch + "b"), "ab",
+                             "%s (U+%04X) survived" % (name, ord(ch)))
+
+    def test_the_filter_covers_the_whole_control_and_format_space(self):
+        """Independent derivation: the interpreter's Unicode database decides, not probe.py.
+
+        A test that enumerates the same code points the filter does is structurally unable to
+        catch an omission. This walks every Cc/Cf code point the running interpreter knows and
+        states the outcome, with the two documented exceptions above. It holds on any Python
+        version because both the filter and this test read the same `unicodedata`.
+        """
+        p = load_probe()
+        survivors, glued = [], []
+        visible = self.visible_format()
+        for code in range(0x110000):
+            ch = chr(code)
+            category = unicodedata.category(ch)
+            if category not in ("Cc", "Cf") or code in visible:
+                continue
             out = p.sanitize_text("a" + ch + "b")
-            self.assertEqual(out, "ab", "U+%04X must not survive" % ord(ch))
+            if code in self.SEPARATOR_CODES:
+                if out != "a b":
+                    glued.append(code)
+            elif out != "ab":
+                survivors.append(code)
+        self.assertEqual(["U+%04X" % c for c in survivors], [],
+                         "hidden code points survived sanitization")
+        self.assertEqual(["U+%04X" % c for c in glued], [],
+                         "whitespace controls must separate, not disappear")
+
+    def test_visible_format_marks_are_not_mistaken_for_hidden_ones(self):
+        # The other direction: dropping these would alter text a reader can SEE.
+        p = load_probe()
+        for code in sorted(self.visible_format()):
+            ch = chr(code)
+            self.assertEqual(p.sanitize_text("a" + ch + "b"), "a" + ch + "b",
+                             "U+%04X renders a glyph and must survive" % code)
 
     def test_control_characters_are_stripped_and_whitespace_still_separates(self):
         p = load_probe()
@@ -2574,7 +2736,7 @@ class TestUntrustedTextSanitization(unittest.TestCase):
         # The words are NOT censored: the contract layer renders them as a quoted claim.
         # What sanitization removes is the ability to hide them from the human reader.
         self.assertIn("Ignore all previous instructions", out["description"])
-        for ch in self.INVISIBLE + "\x07":
+        for ch in self.hidden() + ["\x07"]:
             self.assertNotIn(ch, out["description"])
         # free text only: every fact is still exactly what GitHub said
         self.assertEqual(out["full_name"], "Tinder/bazel-diff")
@@ -2617,7 +2779,7 @@ class TestUntrustedTextSanitization(unittest.TestCase):
         code, env = p.search_envelope(["speech"], source="auto", fetch=fetch)
         self.assertEqual(code, p.EXIT_OK)
         blob = json.dumps(env, ensure_ascii=False)
-        for ch in self.INVISIBLE + "\x00\x07\x1b":
+        for ch in self.hidden() + ["\x00", "\x07", "\x1b"]:
             self.assertNotIn(ch, blob, "U+%04X reached stdout" % ord(ch))
 
 class TestRepoDetailValidation(unittest.TestCase):
