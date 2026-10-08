@@ -448,7 +448,17 @@ def repo_detail(full_name, fetch=urlopen_json):
     This is the lookup that replaces that guess with a fact, through the same
     `normalize_repo` the search path uses so both shapes stay identical — and through
     `_repo_page` first, so a 200 that is not a repository never becomes a null-filled fact.
+
+    `full_name` is validated HERE too, not only in `main()` (Item 3): this is the
+    programmatic entry point, and without the check a caller could send a request for a
+    name that cannot name a repository and then read the API's rejection as a retrieval
+    outcome. The CLI keeps its own check, so a bad name is still exit 3 with no envelope;
+    a library caller gets the clear `ValueError` `build_query` already raises. Nothing is
+    fetched on the rejecting path.
     """
+    if not valid_full_name(full_name):
+        raise ValueError(
+            "repo_detail needs a full_name of the form owner/name, got %r" % (full_name,))
     return normalize_repo(_repo_page(fetch(GITHUB_API + "/repos/" + full_name)))
 
 HN_ENDPOINT = "https://hn.algolia.com/api/v1/search"
@@ -880,8 +890,13 @@ def valid_full_name(full_name):
     §4.2's `repo` takes a full_name, and anything else is a malformed CALL (exit 3), not a
     lookup that found nothing: degraded would read as "the network/API is unhappy" when
     the real answer is "that is not a repository name" (Review Focus #1).
+
+    A non-string is malformed too, and says so as a clean False rather than dying on
+    `.count` inside a callers' `except Exception` (Item 3: `repo_detail` is a library
+    boundary, and a boundary that raises AttributeError for `None` is not a boundary).
     """
-    return (bool(full_name) and full_name.count("/") == 1
+    return (isinstance(full_name, str) and bool(full_name)
+            and full_name.count("/") == 1
             and not any(c.isspace() for c in full_name)
             and all(full_name.split("/")))
 

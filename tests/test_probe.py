@@ -2390,5 +2390,47 @@ class TestUntrustedTextSanitization(unittest.TestCase):
         for ch in self.INVISIBLE + "\x00\x07\x1b":
             self.assertNotIn(ch, blob, "U+%04X reached stdout" % ord(ch))
 
+class TestRepoDetailValidation(unittest.TestCase):
+    """Item 3: `repo_detail` is a library boundary, so it validates like `build_query`.
+
+    `valid_full_name()` was enforced on the CLI path only (`main` checks it before calling
+    `repo_envelope`). A programmatic caller could hand `repo_detail` a name that is not
+    `owner/name` and get a request sent for a lookup that cannot succeed. `build_query`
+    already sets the precedent for this boundary: raise a clear `ValueError` — a malformed
+    call must never be dressed up as a retrieval that found nothing.
+    """
+
+    BAD = ("not-a-full-name", "a/b/c", "/name", "owner/", "", "own er/name", None, 7)
+
+    def test_a_bad_full_name_raises_value_error_and_sends_no_request(self):
+        p = load_probe()
+        calls = []
+        def fetch(url, **kw):
+            calls.append(url)
+            return FAKE_REPO
+        for bad in self.BAD:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                p.repo_detail(bad, fetch=fetch)
+        self.assertEqual(calls, [], "a malformed call must not spend one of the 10 requests")
+
+    def test_a_valid_full_name_is_accepted_and_looked_up_verbatim(self):
+        p = load_probe()
+        seen = []
+        out = p.repo_detail("owner/name",
+                            fetch=lambda url, **kw: seen.append(url) or FAKE_REPO)
+        self.assertEqual(seen, ["https://api.github.com/repos/owner/name"])
+        self.assertEqual(out["kind"], "repo")
+        self.assertEqual(out["full_name"], "Tinder/bazel-diff")
+
+    def test_the_cli_still_rejects_a_bad_name_with_exit_3_and_no_stdout(self):
+        # The CLI path is unchanged by the new library-boundary check: validation still
+        # happens BEFORE the envelope, so the exit code is 3 (bad call), not 2 (degraded).
+        p = load_probe()
+        for bad in self.BAD[:6]:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                code = p.main(["repo", bad])
+            self.assertEqual(code, p.EXIT_BAD_ARGS, bad)
+            self.assertIn("error", err.getvalue(), bad)
+
 if __name__ == "__main__":
     unittest.main()
