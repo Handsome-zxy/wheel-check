@@ -271,6 +271,62 @@ def build_query(terms, suffix):
             "validate_terms() first (a string would be joined per character)" % terms)
     return " ".join(terms) + suffix
 
+UNTRUSTED_TEXT_MAX = 200        # §4.3: how much third-party free text may reach the envelope
+TRUNCATION_MARK = "\u2026"      # a truncated field must LOOK truncated
+
+# Characters a human reader cannot see but the model still reads. Stripping them is the
+# whole point: a description that reads clean on screen must not smuggle a second text
+# past the person who is supposed to judge the candidate. C0/C1 controls, the zero-width
+# set, the bidi overrides/isolates, and the BOM.
+_INVISIBLE = ((0x00, 0x1F), (0x7F, 0x9F), (0x200B, 0x200F), (0x202A, 0x202E),
+              (0x2066, 0x2069), (0xFEFF, 0xFEFF))
+_WHITESPACE_CONTROLS = "\t\n\r\v\f"
+
+def _is_invisible(ch):
+    code = ord(ch)
+    return any(lo <= code <= hi for lo, hi in _INVISIBLE)
+
+def sanitize_text(value):
+    """Third-party free text, made safe to RENDER while staying a faithful quote (§4.3).
+
+    `description`, `title` and `model_id` are written by strangers and are the only
+    channel by which third-party content reaches the model's decision path. This makes
+    three guarantees about what the envelope carries:
+
+    1. **Visible.** C0/C1 controls, zero-width characters and bidi overrides/isolates are
+       dropped. Pairing a benign-looking sentence with invisible text is the cheap way to
+       show the human one thing and the model another; a quote the reader cannot fully see
+       is not evidence. Newlines and tabs become a space so that "a\\nb" stays two words
+       rather than fusing into one.
+    2. **Bounded.** At most `UNTRUSTED_TEXT_MAX` characters, and a cut field ends with
+       `TRUNCATION_MARK` so it is visibly cut instead of silently amputated.
+    3. **Uncensored.** Words are never removed or reworded — an instruction aimed at the
+       agent is still quoted in full (up to the cap) and reported to the user AS CONTENT.
+       Sanitizing is not judging; that is the contract layer's `SKILL.md` rule.
+
+    Only free text goes through here. URLs, numbers, counts, dates, license ids and
+    owner/name are facts and are passed through exactly as the source reported them. The
+    function is the identity on well-formed third-party text.
+
+    `None` for anything that is not a string, and for a string with no visible content
+    left — an empty field is "nothing here", the same `None` the other absent fields use,
+    never `""` that a caller could render as a fact.
+    """
+    if not isinstance(value, str):
+        return None
+    kept = []
+    for ch in value:
+        if ch in _WHITESPACE_CONTROLS:
+            kept.append(" ")
+        elif not _is_invisible(ch):
+            kept.append(ch)
+    text = " ".join("".join(kept).split())
+    if not text:
+        return None
+    if len(text) > UNTRUSTED_TEXT_MAX:
+        text = text[:UNTRUSTED_TEXT_MAX - 1].rstrip() + TRUNCATION_MARK
+    return text
+
 def normalize_repo(item):
     """Reduce a GitHub repo payload to the hard facts the caller may render.
 
@@ -290,7 +346,7 @@ def normalize_repo(item):
         "license": (item.get("license") or {}).get("spdx_id"),
         "archived": bool(item.get("archived")),
         "language": item.get("language"),
-        "description": item.get("description"),
+        "description": sanitize_text(item.get("description")),
     }
 
 def _per_page(limit):
@@ -416,7 +472,7 @@ def _hn_entry(hit):
     oid = hit.get("objectID")
     return {
         "kind": "discussion",
-        "title": hit.get("title"),
+        "title": sanitize_text(hit.get("title")),
         "url": (HN_ITEM % oid) if oid else None,
         "points": hit.get("points"),
         "created_at": (hit.get("created_at") or "")[:10],
@@ -495,8 +551,12 @@ def _hf_entry(model):
     A model with no id gets no URL at all — `None` beats the fabricated
     "huggingface.co/None" a straight string format would hand the caller, the same rule
     `_hn_entry` already follows for a hit without an objectID.
+
+    `model_id` is third-party text and goes through `sanitize_text` (`title`/`description`
+    precedent). The URL is derived from the SANITIZED id on purpose: a link that disagreed
+    with the id rendered next to it would be a link the caller cannot check.
     """
-    model_id = model.get("modelId") or model.get("id")
+    model_id = sanitize_text(model.get("modelId") or model.get("id"))
     return {"kind": "model",
             "model_id": model_id,
             "downloads": model.get("downloads"),
