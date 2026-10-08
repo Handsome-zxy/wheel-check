@@ -1413,9 +1413,38 @@ class TestHuggingFaceGate(unittest.TestCase):
     def test_ai_terms_is_exactly_the_documented_set(self):
         p = load_probe()
         self.assertEqual(p.AI_TERMS,
-                         {"ai", "llm", "model", "embedding", "diffusion", "speech",
-                          "vision", "transcribe", "whisper", "fine-tune", "finetune",
-                          "rag", "agent"})
+                         {"ai", "llm", "embedding", "diffusion", "speech",
+                          "transcribe", "whisper", "fine-tune", "finetune", "rag"})
+
+    def test_the_broad_ambiguous_words_were_dropped(self):
+        # Item 4: `model`, `vision` and `agent` are ordinary words. Measured cost of keeping
+        # them: an eval run for a speech-transcription tool had speech-emotion-recognition
+        # MODELS appended to its list. The requirement that survives the gate must name an
+        # AI/ML concept, not a word that merely tends to appear near one.
+        p = load_probe()
+        for word in ("model", "models", "vision", "agent", "agents"):
+            self.assertNotIn(word, p.AI_TERMS, word)
+            self.assertFalse(p.is_ai_requirement(["a %s for my notes" % word]), word)
+
+    def test_the_narrow_ai_terms_all_fire(self):
+        p = load_probe()
+        for term in ("ai", "llm", "embedding", "diffusion", "speech", "transcribe",
+                     "whisper", "fine-tune", "finetune", "rag"):
+            self.assertTrue(p.is_ai_requirement(["a %s tool" % term]), term)
+
+    def test_explicit_hf_is_unaffected_by_the_gate(self):
+        # The gate decides the CONDITIONAL source only: `--source hf` is a user's explicit
+        # request and must still query the Hub for a requirement full of dropped words.
+        p = load_probe()
+        seen = []
+        def fetch(url, **kw):
+            seen.append(url)
+            return FAKE_HF
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, env = p.search_envelope(["vision agent model"], source="hf", fetch=fetch)
+        self.assertEqual(code, p.EXIT_OK)
+        self.assertTrue(any("huggingface.co" in u for u in seen))
+        self.assertEqual([s["source"] for s in env["sources"]], ["hf"])
 
     def test_matching_is_word_wise_so_a_substring_never_fires(self):
         # "chair" and "e-mail" contain the letters of "ai" but are not the word: a

@@ -527,8 +527,8 @@ def _hn_leg(terms, limit, fetch=urlopen_json, strict_only=False):
     total, results = _hn_hits(terms, limit, fetch)
     return {"tier": "plain", "total": total, "results": results}
 
-AI_TERMS = {"ai", "llm", "model", "embedding", "diffusion", "speech", "vision",
-            "transcribe", "whisper", "fine-tune", "finetune", "rag", "agent"}
+AI_TERMS = {"ai", "llm", "embedding", "diffusion", "speech", "transcribe", "whisper",
+            "fine-tune", "finetune", "rag"}
 HF_ENDPOINT = "https://huggingface.co/api/models"
 HF_MODEL = "https://huggingface.co/%s"
 
@@ -539,6 +539,14 @@ def is_ai_requirement(terms):
     an AI/ML need, so only an AI-shaped requirement is allowed to reach it. The match is
     word-wise and case-insensitive: `chair` contains the letters of `ai` and must not turn
     a generic requirement into a model search.
+
+    The set is deliberately NARROW (Item 4). Every member names an AI/ML concept that a
+    requirement either has or does not have. `model`, `vision` and `agent` were dropped:
+    they are ordinary English words, and the measured cost of keeping them was a
+    speech-transcription eval run whose list came back with speech-emotion-recognition
+    models appended. There is deliberately NO "two terms must match" rule either: that
+    would make this conditional source miss a legitimate AI requirement, and an explicit
+    `--source hf` bypasses the gate entirely.
     """
     words = set()
     for t in terms:
