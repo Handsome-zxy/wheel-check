@@ -628,6 +628,168 @@ class TestRetryPlacement(unittest.TestCase):
             p.search_envelope(["x"], source="github", fetch=fetch)
         self.assertEqual(slept, [1.0])   # spec 6: back off once, never busy-wait
 
+class TestResetAwareRetry(unittest.TestCase):
+    """Item 6a: retry only when the wait fits the budget, and never sleep for real.
+
+    GitHub's search window is 60s while this build's whole-invocation budget is 45s, so the
+    old fixed 1.0s backoff mostly re-confirmed the 403 and spent one of the 10 requests
+    doing it. The reset the response already carries decides it now: inside the budget we
+    sleep until the window reopens, beyond it we do not retry at all and say when the reset
+    is. The clock and the sleeper are injected — no test serves a real wait.
+    """
+
+    NOW = 1800000000.0        # 2027-01-15T08:00:00Z: a fixed epoch, far from any DST edge
+    RESET_LATER = 1800003600  # 2027-01-15T09:00:00Z, one hour beyond the budget
+
+    def _search(self, p, fetch, sleep=None):
+        # strict_only pins the run to ONE tier: these tests count requests per RETRY, and
+        # an empty answer would otherwise walk relaxed/plain and add two requests that have
+        # nothing to do with the reset arithmetic.
+        return p.search_envelope(["x"], source="github", fetch=fetch, strict_only=True,
+                                 clock=lambda: self.NOW,
+                                 sleep=sleep if sleep is not None else (lambda s: None))
+
+    def test_a_reset_inside_the_budget_is_waited_out_and_then_retried(self):
+        p = load_probe()
+        calls, slept = [], []
+        def fetch(url, **kw):
+            calls.append(url)
+            if len(calls) == 1:
+                raise p.RateLimited("429", reset=int(self.NOW) + 12)
+            return {"total_count": 1, "items": [FAKE_REPO]}
+        code, env = self._search(p, fetch, sleep=slept.append)
+        self.assertEqual(slept, [12.0], "sleep until the reset, not a fixed second")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((code, env["status"]), (p.EXIT_OK, "ok"))
+        self.assertEqual(len(env["results"]), 1)
+
+    def test_a_reset_beyond_the_budget_is_not_retried_and_names_the_reset(self):
+        p = load_probe()
+        calls, slept, err = [], [], io.StringIO()
+        def fetch(url, **kw):
+            calls.append(url)
+            raise p.RateLimited("429", reset=self.RESET_LATER)
+        with contextlib.redirect_stderr(err):
+            code, env = self._search(p, fetch, sleep=slept.append)
+        self.assertEqual(len(calls), 1, "one request, not two: the retry cannot succeed")
+        self.assertEqual(slept, [], "and it does not sleep either")
+        self.assertEqual((code, env["status"], env["reason"], env["results"]),
+                         (p.EXIT_DEGRADED, "degraded", "rate-limited", []))
+        self.assertIn("2027-01-15T09:00:00Z", err.getvalue(),
+                      "stderr must name WHEN the window reopens")
+        self.assertIn("reset", err.getvalue().lower())
+
+    def test_the_budget_boundary_is_inclusive(self):
+        # 45s away is the last wait this invocation may serve; one second more is not.
+        p = load_probe()
+        for offset, expect_calls in ((45, 2), (46, 1)):
+            calls, slept = [], []
+            def fetch(url, **kw):
+                calls.append(url)
+                if len(calls) == 1:
+                    raise p.RateLimited("429", reset=int(self.NOW) + offset)
+                return {"total_count": 0, "items": []}
+            with contextlib.redirect_stderr(io.StringIO()):
+                self._search(p, fetch, sleep=slept.append)
+            self.assertEqual(len(calls), expect_calls, "offset=%d" % offset)
+            self.assertEqual(slept, [float(offset)] if expect_calls == 2 else [],
+                             "offset=%d" % offset)
+
+    def test_a_window_that_already_reopened_retries_without_waiting(self):
+        p = load_probe()
+        calls, slept = [], []
+        def fetch(url, **kw):
+            calls.append(url)
+            if len(calls) == 1:
+                raise p.RateLimited("429", reset=int(self.NOW) - 5)
+            return {"total_count": 0, "items": []}
+        self._search(p, fetch, sleep=slept.append)
+        self.assertEqual(slept, [0.0], "a reopened window means retry now, never a negative wait")
+        self.assertEqual(len(calls), 2)
+
+    def test_the_reset_header_on_the_wire_drives_the_same_decision(self):
+        # The reset is read off the 403/429 response itself: no extra request is spent, and
+        # the decision is identical whether the test injects RateLimited or the wire raises.
+        p = load_probe()
+        calls, err = [], io.StringIO()
+        def fetch(url, **kw):
+            calls.append(url)
+            raise urllib.error.HTTPError(url, 403, "rate limited",
+                                         {"X-RateLimit-Reset": str(self.RESET_LATER)}, None)
+        with contextlib.redirect_stderr(err):
+            code, env = self._search(p, fetch)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((code, env["reason"]), (p.EXIT_DEGRADED, "rate-limited"))
+        self.assertIn("2027-01-15T09:00:00Z", err.getvalue())
+        # And a 403 whose header IS inside the budget is still worth the second request.
+        calls2 = []
+        def fetch2(url, **kw):
+            calls2.append(url)
+            if len(calls2) == 1:
+                raise urllib.error.HTTPError(url, 403, "rate limited",
+                                             {"X-RateLimit-Reset": str(int(self.NOW) + 3)}, None)
+            return {"total_count": 0, "items": []}
+        self._search(p, fetch2)
+        self.assertEqual(len(calls2), 2)
+
+    def test_no_reset_in_hand_keeps_the_fixed_backoff(self):
+        # §6's 1.0s wait is the fallback for a rate limit whose window we cannot read.
+        p = load_probe()
+        slept = []
+        def fetch(url, **kw):
+            raise p.RateLimited("403")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self._search(p, fetch, sleep=slept.append)
+        self.assertEqual(slept, [1.0])
+
+    def test_the_default_clock_and_sleeper_are_the_real_ones(self):
+        # The injection is a test seam, not the production path: with nothing passed, the
+        # wait still comes from the module clock/sleeper (both patched here so the suite
+        # never serves 4 seconds for real).
+        p = load_probe()
+        calls, slept = [], []
+        def fetch(url, **kw):
+            calls.append(url)
+            if len(calls) == 1:
+                raise p.RateLimited("429", reset=int(self.NOW) + 4)
+            return {"total_count": 0, "items": []}
+        with unittest.mock.patch.object(p.time, "time", lambda: self.NOW), \
+                unittest.mock.patch.object(p.time, "sleep", slept.append):
+            p.search_envelope(["x"], source="github", fetch=fetch)
+        self.assertEqual(slept, [4.0], "the default must be the module sleeper, not a stub")
+
+    def test_a_wire_reset_beyond_the_budget_costs_no_second_request(self):
+        # The behaviour the item exists for, with no seam in play: a real 403 mentioning a
+        # reset an hour away must not be re-confirmed by a second request.
+        p = load_probe()
+        calls, slept = [], []
+        def fetch(url, **kw):
+            calls.append(url)
+            raise urllib.error.HTTPError(url, 403, "rate limited",
+                                         {"X-RateLimit-Reset": str(self.RESET_LATER)}, None)
+        with unittest.mock.patch.object(p.time, "time", lambda: self.NOW), \
+                unittest.mock.patch.object(p.time, "sleep", slept.append), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code, env = p.search_envelope(["x"], source="github", fetch=fetch,
+                                          strict_only=True)
+        self.assertEqual((len(calls), slept), (1, []),
+                         "the window is an hour away: the retry can only spend quota")
+        self.assertEqual((code, env["reason"]), (p.EXIT_DEGRADED, "rate-limited"))
+
+    def test_the_repo_lookup_shares_the_same_injection(self):
+        p = load_probe()
+        calls, slept = [], []
+        def fetch(url, **kw):
+            calls.append(url)
+            raise p.RateLimited("429", reset=self.RESET_LATER)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, env = p.repo_envelope("o/n", fetch=fetch, clock=lambda: self.NOW,
+                                        sleep=slept.append)
+        self.assertEqual((code, env["status"], len(calls), slept),
+                         (p.EXIT_DEGRADED, "degraded", 1, []))
+        self.assertIn("2027-01-15T09:00:00Z", err.getvalue())
+
 class TestFetchFailureClassification(unittest.TestCase):
     """Every way a fetch can fail must land in `degraded`, never in a traceback."""
 

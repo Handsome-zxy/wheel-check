@@ -15,10 +15,14 @@ EXIT_OK = 0
 EXIT_DEGRADED = 2
 EXIT_BAD_ARGS = 3
 
-RETRY_BACKOFF = 1.0   # seconds between the original request and its one retry (§6)
+RETRY_BACKOFF = 1.0   # the fallback wait when a rate limit names no reset (§6, Item 6a)
 RETRY_BUDGET = 1      # retries allowed for a WHOLE `search` INVOCATION (Item 2): the
                       # invocation ceiling is 3 tier requests + 1 retry = 4, and the
                       # ladder stops at the first tier that returns hits (typically 1-2)
+SEARCH_BUDGET_SECONDS = 45.0   # §4.2's whole-invocation time budget, and therefore the
+                               # longest wait a rate-limited retry may ever serve: GitHub's
+                               # search window is 60s, so a reset further out than this is
+                               # not worth a second request (Item 6a)
 
 UA = {"User-Agent": "wheel-check", "Accept": "application/vnd.github+json"}
 
@@ -98,7 +102,32 @@ def urlopen_json(url, headers=None, timeout=15):
         return json.load(r)
 
 class RateLimited(Exception):
-    """403/429: the GitHub quota is exhausted (unauthenticated: 10 requests/minute)."""
+    """403/429: the GitHub quota is exhausted (unauthenticated: 10 requests/minute).
+
+    Carries `reset` — the epoch second the window reopens — whenever the response said so,
+    which is what turns the retry from a blind 1.0s re-confirmation into a decision
+    (Item 6a): inside the budget we wait for the reset, beyond it we do not retry at all.
+    A rate limit with no reset in hand keeps the old fixed backoff.
+    """
+
+    def __init__(self, message="", reset=None):
+        Exception.__init__(self, message)
+        self.reset = reset
+
+def _rate_limit_reset(exc):
+    """The epoch second the quota window reopens, read off the 403/429 response itself.
+
+    GitHub sends `X-RateLimit-Reset` as an epoch second on a quota rejection, so the reset
+    is already in hand and reading it costs no request. `Retry-After` is deliberately NOT
+    consulted: it is a delay in seconds, not a timestamp, and adding the two together would
+    invent a reset time. Anything unreadable is `None` — "no reset in hand", never zero.
+    """
+    headers = getattr(exc, "headers", None)
+    raw = headers.get("X-RateLimit-Reset") if hasattr(headers, "get") else None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 class Timeout(Exception):
     """A request that ran out of time: socket timeout, or an HTTP timeout response."""
@@ -148,7 +177,7 @@ def _classify(exc):
         return exc
     if isinstance(exc, urllib.error.HTTPError):     # also a URLError: check first
         if exc.code in (403, 429):
-            return RateLimited(str(exc.code))
+            return RateLimited(str(exc.code), reset=_rate_limit_reset(exc))
         if 400 <= exc.code < 500:
             return InternalError(exc)               # delivered and rejected, not transport
         return Timeout("http-%s" % exc.code)
@@ -213,12 +242,58 @@ def _warn_supplement_failed(source, problem):
           "absence, and sources marks %s as failed"
           % (source, _degraded_reason(problem), source))
 
-def _with_retry(fn, attempts=2, backoff=RETRY_BACKOFF):
-    """Call fn(); on a rate limit sleep `backoff` and try again, then re-raise.
+def _retry_wait(problem, backoff, now, budget=SEARCH_BUDGET_SECONDS):
+    """How long to wait before retrying this rate limit; `None` means: do NOT retry.
+
+    GitHub's search window is 60s while this invocation's whole budget is 45s, so the old
+    blind 1.0s retry mostly re-confirmed the 403 and spent one of the 10 requests doing it.
+    The response's own reset decides instead:
+
+    - **inside the budget** -> sleep exactly until the window reopens (capped at the
+      budget), which is the one retry that can actually succeed;
+    - **beyond the budget** -> no retry at all: the caller gets `degraded` +
+      `rate-limited` one request cheaper, and stderr names the reset.
+
+    With no reset in hand the pre-existing fixed `backoff` stands: a rate limit whose window
+    we cannot read is still worth one cheap confirmation (§6). A window that has already
+    reopened waits 0, never a negative number.
+    """
+    reset = getattr(problem, "reset", None)
+    if reset is None:
+        return backoff
+    delay = reset - now
+    if delay > budget:
+        return None
+    return max(0.0, min(delay, budget))
+
+def _warn_retry_abandoned(problem, now):
+    """One stderr line when the reset is too far away to be worth a second request.
+
+    The envelope already says `degraded` / `rate-limited`; what it cannot say is WHEN the
+    window reopens, because `reason` is a fixed vocabulary with no room for a timestamp.
+    This is what makes the refused retry actionable instead of mysterious.
+    """
+    reset = problem.reset
+    delay = max(0, int(reset - now))
+    _warn("error: GitHub quota is rate limited and resets at %s (%ds away), beyond the "
+          "%ds budget; not retrying (a retry would only spend another request; set "
+          "GITHUB_TOKEN for 30 requests/minute)"
+          % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset)), delay,
+             int(SEARCH_BUDGET_SECONDS)))
+
+def _with_retry(fn, attempts=2, backoff=RETRY_BACKOFF, clock=None, sleep=None):
+    """Call fn(); on a rate limit wait for the right moment and try again, then re-raise.
 
     Only quota errors are worth retrying — a 5xx or a dead socket is raised as-is
     after being classified. `attempts=2` means the original request plus one retry.
+
+    The wait is `_retry_wait`'s decision: until the reset when the response named one inside
+    the budget, the fixed `backoff` when it did not, and no retry at all when the reset is
+    further out than the budget. `clock`/`sleep` are injectable so a test can prove the
+    arithmetic without ever serving the wait (Item 6a).
     """
+    now_fn = time.time if clock is None else clock
+    sleep_fn = time.sleep if sleep is None else sleep
     last = None
     for i in range(attempts):
         try:
@@ -226,12 +301,16 @@ def _with_retry(fn, attempts=2, backoff=RETRY_BACKOFF):
         except Exception as e:          # noqa: BLE001 - classify, then re-raise
             last = _classify(e)
             if isinstance(last, RateLimited) and i + 1 < attempts:
-                time.sleep(backoff)
+                wait = _retry_wait(last, backoff, now_fn())
+                if wait is None:
+                    _warn_retry_abandoned(last, now_fn())
+                    raise last
+                sleep_fn(wait)
                 continue
             raise last
     raise last
 
-def _retrying_fetch(fetch, backoff=RETRY_BACKOFF):
+def _retrying_fetch(fetch, backoff=RETRY_BACKOFF, clock=None, sleep=None):
     """Wrap `fetch` with the 403/429 retry, charged to the search as a whole.
 
     The retry belongs to the REQUEST, not to the tier loop: `github_search` spends one
@@ -242,6 +321,9 @@ def _retrying_fetch(fetch, backoff=RETRY_BACKOFF):
     requests + one retry = four. The plan's budget is stated in INVOCATIONS, not requests
     (§4.2 for the caller, Item 2): <=3 `probe.py search` calls and <=45s in total, which is
     what makes four requests per call fit inside an unauthenticated 10/minute window.
+
+    `clock`/`sleep` reach `_with_retry` unchanged: they exist so a caller (a test, an
+    embedding program) owns the wait without patching the `time` module.
     """
     budget = {"retries": RETRY_BUDGET}
     def wrapped(url, **kw):
@@ -250,7 +332,8 @@ def _retrying_fetch(fetch, backoff=RETRY_BACKOFF):
             made.append(1)
             return fetch(url, **kw)
         try:
-            return _with_retry(call, attempts=1 + budget["retries"], backoff=backoff)
+            return _with_retry(call, attempts=1 + budget["retries"], backoff=backoff,
+                               clock=clock, sleep=sleep)
         finally:
             if len(made) > 1:           # a retry was really spent, charge it
                 budget["retries"] -= 1
@@ -690,7 +773,8 @@ def _degraded(reason, source="github"):
             "sources": [{"source": source, "status": "degraded"}],
             "results": []}
 
-def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_only=False):
+def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_only=False,
+                    clock=None, sleep=None):
     """Run the source legs; return (exit_code, envelope) in the §4.3 shape.
 
     `status: "ok"` with `results: []` is the ONLY "there is genuinely nothing"
@@ -719,6 +803,11 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
     `reason` is None when the cause is outside §4.3's vocabulary (internal error,
     unimplemented source): the envelope is still `degraded`, and stderr carries the
     real exception type. stdout is always pure JSON.
+
+    `clock`/`sleep` are the retry's time seam (Item 6a): they default to `time.time` /
+    `time.sleep`, and a caller that passes its own owns the wait — a test proves the
+    reset arithmetic without serving it. A rate limit whose reset is further away than
+    `SEARCH_BUDGET_SECONDS` is not retried at all.
     """
     wanted = "github" if source == "auto" else source
     leg = _source_legs().get(wanted)
@@ -726,7 +815,7 @@ def search_envelope(terms, source="auto", limit=8, fetch=urlopen_json, strict_on
         _warn("error: --source %s has no retriever in this build; no query was sent "
               "and GitHub was NOT queried in its place" % wanted)
         return EXIT_DEGRADED, _degraded(None, source=wanted)
-    retrying = _retrying_fetch(fetch)
+    retrying = _retrying_fetch(fetch, clock=clock, sleep=sleep)
     try:
         found = leg(terms, limit, fetch=retrying, strict_only=strict_only)
         # Read and validate the leg's payload INSIDE the protected region: a leg is an
@@ -916,15 +1005,17 @@ def valid_full_name(full_name):
             and not any(c.isspace() for c in full_name)
             and all(full_name.split("/")))
 
-def repo_envelope(full_name, fetch=urlopen_json):
+def repo_envelope(full_name, fetch=urlopen_json, clock=None, sleep=None):
     """(exit_code, envelope) for ONE repository: §4.2's hard-fact lookup, single result.
 
     A direct lookup runs no filter ladder, so its source entry carries no `tier` and no
     `total`: neither fact exists for "tell me about this exact repository", and inventing
     them would be the kind of made-up number this contract bans.
+
+    `clock`/`sleep` are the same retry time seam `search_envelope` takes (Item 6a).
     """
     try:
-        entry = repo_detail(full_name, fetch=_retrying_fetch(fetch))
+        entry = repo_detail(full_name, fetch=_retrying_fetch(fetch, clock=clock, sleep=sleep))
     except Exception as exc:        # noqa: BLE001 - any lookup failure degrades
         problem = _classify(exc)
         if isinstance(problem, InternalError) and isinstance(problem.cause,
