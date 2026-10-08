@@ -16,7 +16,9 @@ EXIT_DEGRADED = 2
 EXIT_BAD_ARGS = 3
 
 RETRY_BACKOFF = 1.0   # seconds between the original request and its one retry (§6)
-RETRY_BUDGET = 1      # retries allowed for a WHOLE search: 3 tier requests + 1 retry
+RETRY_BUDGET = 1      # retries allowed for a WHOLE `search` INVOCATION (Item 2): the
+                      # invocation ceiling is 3 tier requests + 1 retry = 4, and the
+                      # ladder stops at the first tier that returns hits (typically 1-2)
 
 UA = {"User-Agent": "wheel-check", "Accept": "application/vnd.github+json"}
 
@@ -237,7 +239,9 @@ def _retrying_fetch(fetch, backoff=RETRY_BACKOFF):
     + retry) and then raise, so the loop never advances into relaxed/plain against an
     API that is already refusing. Retrying per call instead would let one search cost
     up to six requests; one retry for the whole search keeps the ceiling at three tier
-    requests + one retry = four (plan budget: <=3 searches, <=45s).
+    requests + one retry = four. The plan's budget is stated in INVOCATIONS, not requests
+    (§4.2 for the caller, Item 2): <=3 `probe.py search` calls and <=45s in total, which is
+    what makes four requests per call fit inside an unauthenticated 10/minute window.
     """
     budget = {"retries": RETRY_BUDGET}
     def wrapped(url, **kw):

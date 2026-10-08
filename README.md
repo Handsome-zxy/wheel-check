@@ -38,7 +38,7 @@
 | **L3** | 宿主 `web_search` / `web_fetch` 查网页 | L1、L2 都不可用 | **不可信——star / 日期必须标"未核实"** |
 
 - 能用 L1 就用 L1，否则退 L2，再否则退 L3；**任何一次降级都要写在用户看得到的地方**，绝不静默降级。
-- 预算：一次"新建"最多 3 次检索、总耗时 ≤45 秒；预算耗尽的结论要标"未查全"，**绝不**因为超预算就说"没有先例"。
+- 预算：一次"新建"最多 **3 次 `probe.py search` 调用**、总耗时 ≤45 秒（单位是**调用次数**，不是请求数）。每次调用最多 4 次 GitHub 请求（3 个档位 + 最多 1 次重试），通常 1–2 次；未认证 10 次/分钟 ≈ 2 次完整调用/分钟。预算耗尽的结论要标"未查全"，**绝不**因为超预算就说"没有先例"。
 
 ### 4. 行为契约：什么时候出声、什么时候闭嘴
 
@@ -94,7 +94,7 @@ python <skills>/wheel-check/scripts/probe.py search --terms "markdown viewer" --
 - **脚本从不打印、不回显 token**：stdout 是纯 JSON，诊断只走 stderr，两处都不含 token（有回归测试盯着）。
 - 设置方式：POSIX `export GITHUB_TOKEN=...`；PowerShell `$env:GITHUB_TOKEN = "..."`；或在宿主的进程环境里持久化。
 - token 无效 / 过期时，GitHub 回 401，脚本报 `degraded`（`reason: null`，原始状态码在 stderr）——它**不会**悄悄退回匿名，也不会假装查到了空结果。
-- 一次检索的请求预算：≤3 个过滤档位（每档 1 次请求）+ 最多 1 次 403/429 重试。
+- 一次 `probe.py search` 调用的请求预算：≤3 个过滤档位（每档 1 次请求）+ 最多 1 次 403/429 重试 = **最多 4 次 GitHub 请求**，命中即停（通常 1–2 次）。未认证 10 次/分钟 ≈ 2 次完整调用/分钟；设了 `GITHUB_TOKEN` 是 30 次/分钟。
 
 隐私：不采集遥测；脚本本身不写任何文件，只向上面三个公开端点发出你这次检索所需的请求。
 
@@ -184,7 +184,7 @@ The problem: nothing forces an agent to check whether someone has already solved
 | **L3** | The host's `web_search` / `web_fetch` on web pages | L1 and L2 both unavailable | **NOT trustworthy — every star count and date must be labelled unverified** |
 
 - Prefer L1, fall back to L2, then L3; **every degradation is stated where the user can see it** — never silent.
-- Budget: at most 3 searches and ~45 seconds per "new build". A budget-exhausted answer must be labelled incomplete — never turned into "there is no precedent".
+- Budget: at most **3 `probe.py search` invocations** and ~45 seconds per "new build" (the unit is invocations, not requests). Each invocation spends at most 4 GitHub requests (3 tiers + at most one retry), typically 1–2, because the tier ladder stops at the first tier that returns hits; unauthenticated, 10 requests/minute is ≈2 full invocations per minute. A budget-exhausted answer must be labelled incomplete — never turned into "there is no precedent".
 
 ### 4. The behaviour contract: when to speak, when to stay quiet
 
@@ -240,7 +240,7 @@ python <skills>/wheel-check/scripts/probe.py search --terms "markdown viewer" --
 - **The token is never printed or echoed**: stdout is pure JSON, diagnostics go to stderr, and neither contains it (regression-tested).
 - How to set it: `export GITHUB_TOKEN=...` (POSIX) or `$env:GITHUB_TOKEN = "..."` (PowerShell), or persist it in the host's process environment.
 - An invalid or expired token makes GitHub answer 401, which surfaces as `degraded` (`reason: null`, raw status on stderr). It does **not** silently fall back to anonymous, and it never pretends an empty result.
-- Request budget per search: ≤3 filter tiers (one request each) plus at most one 403/429 retry.
+- Request budget for one `probe.py search` invocation: ≤3 filter tiers (one request each) plus at most one 403/429 retry = **at most 4 GitHub requests**, stopping at the first tier that hits (typically 1–2). Unauthenticated, 10 requests/minute is ≈2 full invocations per minute; with `GITHUB_TOKEN` it is 30 requests/minute.
 
 Privacy: no telemetry; the script itself writes no files and only sends the requests this search needs to the three public endpoints above.
 
