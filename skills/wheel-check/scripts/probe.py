@@ -90,15 +90,84 @@ def github_tiers():
         ("plain", ""),
     ]
 
+def _same_host(first, second):
+    """True when two URLs share a netloc — host AND port, compared case-insensitively.
+
+    The port is part of the comparison on purpose: `127.0.0.1:8000 -> 127.0.0.1:8001` is a
+    different origin by every browser's rule, and the loopback test can prove exactly that
+    case. `api.github.com -> api.github.com:8443` is therefore cross-host too.
+    """
+    return (urllib.parse.urlsplit(first).netloc.lower()
+            == urllib.parse.urlsplit(second).netloc.lower())
+
+class _SameHostAuthRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but never carry `Authorization` off the original netloc (Item 6b).
+
+    CPython's `HTTPRedirectHandler.redirect_request` rebuilds the outgoing request from
+    `req.headers` minus the content headers — and keeps `Authorization` (verified on 3.13;
+    every earlier 3.x behaves the same). A GitHub response that redirected elsewhere would
+    therefore hand the `Bearer` token to that host. This handler keeps the header while the
+    redirect stays inside the netloc the credential was issued for, and drops it — from
+    both header stores urllib sends — the moment the redirect leaves.
+
+    A cross-host redirect is still FOLLOWED, unauthenticated. Returning `None` here would
+    abort the redirect and turn a redirect into a failure, which is a different behaviour
+    than the one being fixed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
+        if new is None or _same_host(req.full_url, new.full_url):
+            return new
+        for store in (new.headers, new.unredirected_hdrs):
+            for name in [key for key in store if key.lower() == "authorization"]:
+                del store[name]
+        return new
+
+def _carries_authorization(req):
+    """True when this request has a credential the guard exists to protect."""
+    names = list(req.headers) + list(getattr(req, "unredirected_hdrs", {}))
+    return any(name.lower() == "authorization" for name in names)
+
+_GUARDED_OPENER = None
+
+def _guarded_opener():
+    """The opener for credential-bearing requests: one redirect guard, built once.
+
+    `build_opener` skips its own `HTTPRedirectHandler` when handed an instance of a
+    subclass, so this opener follows redirects through `_SameHostAuthRedirect` and carries
+    every other default handler unchanged.
+    """
+    global _GUARDED_OPENER
+    if _GUARDED_OPENER is None:
+        _GUARDED_OPENER = urllib.request.build_opener(_SameHostAuthRedirect())
+    return _GUARDED_OPENER
+
+def _open(req, timeout):
+    """Send one prepared request: the guarded opener when a credential is attached (6b).
+
+    `request_headers` attaches `Authorization` to `api.github.com` requests only (§6), so
+    in this build "carries a credential" and "is a GitHub request" are the same set, and a
+    request without a credential is sent exactly as it always was — `urllib.request.urlopen`,
+    the seam every transport test in the suite patches. The guard keys on the credential
+    rather than on the host so that it also covers a caller's own headers and any future
+    authenticated source; a host test would miss both.
+    """
+    if _carries_authorization(req):
+        return _guarded_opener().open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
 def urlopen_json(url, headers=None, timeout=15):
     """Default `fetch`: one GET, JSON body. Callers may inject their own.
 
     `headers=None` means this file's own headers, which carry `GITHUB_TOKEN` when the
     environment sets one (see `request_headers`). A caller passing its own headers owns
-    the request completely, credential included.
+    the request completely, credential included — `_open` is what keeps that credential
+    from following a redirect to another host (Item 6b).
     """
     req = urllib.request.Request(url, headers=headers or request_headers(url))
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _open(req, timeout) as r:
         return json.load(r)
 
 class RateLimited(Exception):

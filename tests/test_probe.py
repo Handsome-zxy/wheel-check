@@ -1,5 +1,5 @@
 # tests/test_probe.py
-import contextlib, importlib.util, io, json, os, pathlib, re, socket, sys, unittest, unittest.mock, urllib.error, urllib.parse
+import contextlib, http.server, importlib.util, io, json, os, pathlib, re, socket, sys, threading, unittest, unittest.mock, urllib.error, urllib.parse
 from datetime import date
 
 # Never let the suite cache bytecode next to the skill payload. `load_probe()` execs
@@ -445,13 +445,20 @@ class TestGithubToken(unittest.TestCase):
     SEARCH_URL = "https://api.github.com/search/repositories?q=x"
 
     def _captured(self, p, urls, environ, body=b"{}"):
-        """urlopen_json() each url; return {url: authorization header value or None}."""
+        """urlopen_json() each url; return {url: authorization header value or None}.
+
+        The transport seam patched here is `probe._open`, not `urllib.request.urlopen`: a
+        CREDENTIAL-BEARING request goes through the guarded opener (Item 6b), so patching
+        urlopen would let the real network in — precisely what this suite forbids. `_open`
+        is the single function every request passes through, credential or not, so this
+        proves the header the code attaches without ever building a socket.
+        """
         seen = {}
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             sent = {k.lower(): v for k, v in req.header_items()}
             seen[req.full_url] = sent.get("authorization")
             return self._Resp(body)
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", fake_urlopen), \
+        with unittest.mock.patch.object(p, "_open", fake_open), \
                 unittest.mock.patch.dict(os.environ, environ):
             for url in urls:
                 p.urlopen_json(url)
@@ -495,10 +502,11 @@ class TestGithubToken(unittest.TestCase):
 
     def test_a_real_search_carries_the_token_on_the_github_legs_only(self):
         # End-to-end through main()'s own fetch: the header choice is proven for the URLs
-        # the pipeline really builds, including the two supplements.
+        # the pipeline really builds, including the two supplements. The seam is `_open`
+        # (the one function every request reaches), so the guarded opener never dials out.
         p = load_probe()
         seen = {}
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             sent = {k.lower(): v for k, v in req.header_items()}
             seen[req.full_url] = sent.get("authorization")
             if "hn.algolia.com" in req.full_url:
@@ -506,7 +514,7 @@ class TestGithubToken(unittest.TestCase):
             if "huggingface.co" in req.full_url:
                 return self._Resp(b"[]")
             return self._Resp(b'{"total_count": 0, "items": []}')
-        with unittest.mock.patch.object(p.urllib.request, "urlopen", fake_urlopen), \
+        with unittest.mock.patch.object(p, "_open", fake_open), \
                 unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": self.TOKEN}):
             code, env = p.search_envelope(["speech"], fetch=p.urlopen_json)
         self.assertEqual(code, p.EXIT_OK)
@@ -524,10 +532,10 @@ class TestGithubToken(unittest.TestCase):
         # quote a request. Neither may contain the token.
         p = load_probe()
         for status in (403, 401):
-            def fake_urlopen(req, timeout=None, status=status):
+            def fake_open(req, timeout=None, status=status):
                 raise urllib.error.HTTPError(req.full_url, status, "nope", {}, None)
             out, err = io.StringIO(), io.StringIO()
-            with unittest.mock.patch.object(p.urllib.request, "urlopen", fake_urlopen), \
+            with unittest.mock.patch.object(p, "_open", fake_open), \
                     unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": self.TOKEN}), \
                     unittest.mock.patch.object(p.time, "sleep", lambda seconds: None), \
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -2653,6 +2661,193 @@ class TestRepoDetailValidation(unittest.TestCase):
                 code = p.main(["repo", bad])
             self.assertEqual(code, p.EXIT_BAD_ARGS, bad)
             self.assertIn("error", err.getvalue(), bad)
+
+class _LoopbackServer:
+    """A real 127.0.0.1 HTTP server on an ephemeral port, and a record of what it received.
+
+    Item 6(b) is proved with an actual redirect rather than an assertion about a handler:
+    these are loopback sockets, not the real API, so the "no test touches a live endpoint"
+    rule is untouched. `responder(path)` returns `(status, headers, body)`.
+    """
+
+    def __init__(self, responder):
+        self.responder = responder
+        self.seen = []          # Authorization header per request, in arrival order
+        self.paths = []         # request paths, so a hop can be identified
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def do_GET(self):
+                outer.seen.append(self.headers.get("Authorization"))
+                outer.paths.append(self.path)
+                status, headers, body = outer.responder(self.path)
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):    # a test server has no business on stderr
+                pass
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        # A short poll interval keeps shutdown() (called from cleanup) from costing the
+        # suite half a second per server for no reason.
+        self.thread = threading.Thread(target=self.httpd.serve_forever,
+                                       kwargs={"poll_interval": 0.05}, daemon=True)
+        self.thread.start()
+
+    def url(self, path):
+        return "http://127.0.0.1:%d%s" % (self.port, path)
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+class TestCrossHostRedirectGuard(unittest.TestCase):
+    """Item 6(b): a credential must never follow a redirect off its own host.
+
+    CPython's `HTTPRedirectHandler.redirect_request` rebuilds the outgoing request from
+    `req.headers` minus the content headers, so `Authorization` is copied to the new host
+    (verified on 3.13 — the control test below demonstrates it). Two loopback servers prove
+    the guard's behaviour on the wire: the cross-host hop arrives WITHOUT the header, and a
+    same-host redirect still carries it.
+    """
+
+    TOKEN = "Bearer LOOPBACK-SENTINEL"
+
+    def setUp(self):
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        except Exception as exc:        # noqa: BLE001 - the suite must survive a no-socket host
+            self.skipTest("loopback sockets unavailable here: %r" % (exc,))
+        probe.close()
+
+    def _json_server(self):
+        server = _LoopbackServer(
+            lambda path: (200, {"Content-Type": "application/json"}, b'{"ok": true}'))
+        self.addCleanup(server.stop)
+        return server
+
+    def _redirector(self, target):
+        server = _LoopbackServer(lambda path: (302, {"Location": target}, b""))
+        self.addCleanup(server.stop)
+        return server
+
+    def test_a_credential_does_not_follow_a_cross_host_redirect(self):
+        p = load_probe()
+        second = self._json_server()
+        first = self._redirector(second.url("/next"))
+        body = p.urlopen_json(first.url("/start"), headers={"Authorization": self.TOKEN})
+        self.assertEqual(body, {"ok": True})
+        self.assertEqual(first.paths, ["/start"])
+        self.assertEqual(second.paths, ["/next"], "the redirect must really have been followed")
+        self.assertEqual(first.seen, [self.TOKEN],
+                         "the first hop IS the host the credential was issued for")
+        self.assertIsNone(second.seen[0],
+                          "the second host received the GitHub credential: the guard failed")
+
+    def test_a_same_host_redirect_keeps_the_credential(self):
+        p = load_probe()
+        server = _LoopbackServer(lambda path: (
+            (302, {"Location": "/next"}, b"") if path == "/start"
+            else (200, {"Content-Type": "application/json"}, b'{"ok": true}')))
+        self.addCleanup(server.stop)
+        body = p.urlopen_json(server.url("/start"), headers={"Authorization": self.TOKEN})
+        self.assertEqual(body, {"ok": True})
+        self.assertEqual(server.paths, ["/start", "/next"])
+        self.assertEqual(server.seen, [self.TOKEN, self.TOKEN],
+                         "a redirect inside the same netloc is not a reason to drop it")
+
+    def test_the_default_handler_would_have_leaked_the_credential(self):
+        # The control that keeps the two tests above honest: plain urllib, no guard, same
+        # servers — and the second host DOES receive the header.
+        second = self._json_server()
+        first = self._redirector(second.url("/next"))
+        req = urllib.request.Request(first.url("/start"),
+                                     headers={"Authorization": self.TOKEN})
+        with urllib.request.urlopen(req, timeout=15) as response:
+            response.read()
+        self.assertEqual(second.seen, [self.TOKEN],
+                         "if this fails the guard tests above prove nothing")
+
+class TestGuardedOpenerSelection(unittest.TestCase):
+    """The guard is wired into the requests that carry a credential, and only those.
+
+    `request_headers` attaches `Authorization` to `api.github.com` requests alone (§6), so
+    in this build "credential-bearing" and "GitHub" are the same set. The guard keys on the
+    credential itself so it protects whatever request carries one; a request without one
+    takes the unchanged `urllib.request.urlopen` path.
+    """
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    TOKEN = "Bearer LOOPBACK-SENTINEL"
+
+    def test_a_token_bearing_github_request_uses_the_guarded_opener(self):
+        p = load_probe()
+        seen = []
+        class Spy:
+            def open(self, req, timeout=None):
+                seen.append({k.lower(): v for k, v in req.header_items()})
+                return TestGuardedOpenerSelection._Resp(b"{}")
+        with unittest.mock.patch.object(p, "_guarded_opener", lambda: Spy()), \
+                unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "SPY-TOKEN"}):
+            p.urlopen_json(p.GITHUB_RATE_LIMIT)
+        self.assertEqual(seen[0].get("authorization"), "Bearer SPY-TOKEN")
+
+    def test_a_request_without_a_credential_uses_plain_urlopen(self):
+        # Two ways to arrive without a credential: no token at all, and a token that is
+        # simply not a GitHub request (Algolia and the Hub must never see it).
+        p = load_probe()
+        calls = []
+        def fake_urlopen(req, timeout=None):
+            calls.append((req.full_url, {k.lower(): v for k, v in req.header_items()}))
+            return TestGuardedOpenerSelection._Resp(b"{}")
+        def refuse():
+            raise AssertionError("no credential to protect: the guarded opener is not used")
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", fake_urlopen), \
+                unittest.mock.patch.object(p, "_guarded_opener", refuse), \
+                unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "SPY-TOKEN"}):
+            p.urlopen_json("https://hn.algolia.com/api/v1/search?query=x")
+            p.urlopen_json("https://huggingface.co/api/models?search=x")
+        with unittest.mock.patch.object(p.urllib.request, "urlopen", fake_urlopen), \
+                unittest.mock.patch.object(p, "_guarded_opener", refuse), \
+                unittest.mock.patch.dict(os.environ, {"GITHUB_TOKEN": "", "GH_TOKEN": ""}):
+            p.urlopen_json(p.GITHUB_RATE_LIMIT)
+        self.assertEqual([auth.get("authorization") for _, auth in calls], [None, None, None])
+
+    def test_the_guard_keeps_authorization_within_the_same_netloc_and_drops_it_otherwise(self):
+        # The handler's own contract, asserted directly as well as on the wire: returning
+        # None here would abort the redirect instead of following it unauthenticated.
+        p = load_probe()
+        handler = p._SameHostAuthRedirect()
+        req = urllib.request.Request("https://api.github.com/x",
+                                     headers={"Authorization": self.TOKEN,
+                                              "Accept": "application/vnd.github+json"})
+        same = handler.redirect_request(req, None, 302, "Found", {},
+                                        "https://api.github.com/y")
+        self.assertEqual(same.get_header("Authorization"), self.TOKEN)
+        self.assertEqual(same.get_header("Accept"), "application/vnd.github+json")
+        other = handler.redirect_request(req, None, 302, "Found", {},
+                                         "https://evil.example/y")
+        self.assertIsNotNone(other, "a cross-host redirect is followed, just unauthenticated")
+        self.assertIsNone(other.get_header("Authorization"))
+        self.assertEqual(other.get_header("Accept"), "application/vnd.github+json")
+        # A port change is a different origin too: the netloc is compared as a whole.
+        port = handler.redirect_request(req, None, 302, "Found", {},
+                                        "https://api.github.com:8443/y")
+        self.assertIsNone(port.get_header("Authorization"))
 
 if __name__ == "__main__":
     unittest.main()
