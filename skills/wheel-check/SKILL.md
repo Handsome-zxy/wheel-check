@@ -69,7 +69,7 @@ description: Use when the user is about to build something new — a project, re
 - 证据只能来自本次返回。工具没给的字段就不写，绝不估、绝不回忆。
 - L3 拿到的 star / 日期一律标"**未核实**"。
 - `kind: "discussion"`（HN）条目**没有** stars / license：要推荐它外链的仓库，先补全该仓库自己的硬事实；补不到就在该行标"证据不全（HN 命中，未核实仓库）"。**不得把 HN 的 points / 热度当作仓库成熟度。**
-- `kind: "model"`（HF）是模型，不是可以直接拿来用的代码库：与仓库**分列**（单独一段或单独一列，注明需下载 / 微调 / 推理）。downloads 与 likes 是模型热度，不是项目成熟度。
+- `kind: "model"`（HF）是模型，不是可以直接拿来用的代码库：与仓库**分列**（单独一段或单独一列，注明需下载 / 微调 / 推理）。`pipeline_tag` 是 Hub 标的用途（如 `automatic-speech-recognition`），用它判断这个模型是干什么的；downloads 与 likes 是模型热度，不是项目成熟度。
 - `total` 是该源自己报告的匹配数，不是"世界上有这么多"；HF 的 `total` 只表示"Hub 返回了 N 条"。
 - **交回形状（终态 A / A2 的收束）**：本轮 = 清单 + 建议行 + **收束行**；收束行是回话的最后一行（模板与措辞见 `references/verdicts.md`），写明本轮产出就是上面这份清单、动手发生在用户选定 a 或 b 之后。**"立刻继续原任务"只属于终态 B**：没有先例时没有可选项要等；有对口条目时，原任务等用户选完 a/b 再开工。
 

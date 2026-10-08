@@ -1506,10 +1506,41 @@ class TestHuggingFaceNormalization(unittest.TestCase):
     def test_model_entry_has_exactly_the_hub_field_set(self):
         p = load_probe()
         item = p.hf_search(["speech to text"], 5, fetch=lambda url, **kw: FAKE_HF)[0]
-        self.assertEqual(sorted(item), ["downloads", "kind", "likes", "model_id", "url"])
+        self.assertEqual(sorted(item),
+                         ["downloads", "kind", "likes", "model_id", "pipeline_tag", "url"])
         for repo_field in ("stars", "license", "archived", "pushed_at", "language",
                            "description", "full_name"):
             self.assertNotIn(repo_field, item)
+
+    def test_model_entry_carries_the_hub_pipeline_tag(self):
+        # Item 5: `pipeline_tag` is what makes a model decidable BY USE
+        # ("automatic-speech-recognition") instead of by download count.
+        p = load_probe()
+        models = [{"modelId": "openai/whisper-large-v3", "downloads": 2400000,
+                   "likes": 4100, "pipeline_tag": "automatic-speech-recognition",
+                   "library_name": "transformers"}]
+        item = p.hf_search(["speech to text"], 5, fetch=lambda url, **kw: models)[0]
+        self.assertEqual(item["pipeline_tag"], "automatic-speech-recognition")
+        self.assertNotIn("library_name", item)   # not asked for: the envelope stays minimal
+
+    def test_an_absent_pipeline_tag_is_none_not_an_empty_string(self):
+        p = load_probe()
+        item = p.hf_search(["speech to text"], 5, fetch=lambda url, **kw: FAKE_HF)[0]
+        self.assertIsNone(item["pipeline_tag"],
+                          "an absent field is None, the same rule pushed_at follows")
+        # A non-string tag is absent too: the tag is a Hub-supplied label, and a model
+        # object carrying a number there has no usable tag.
+        numeric = [{"modelId": "o/n", "downloads": 1, "pipeline_tag": 7}]
+        self.assertIsNone(p.hf_search(["x"], 5, fetch=lambda url, **kw: numeric)[0]["pipeline_tag"])
+
+    def test_pipeline_tag_is_third_party_text_and_goes_through_the_sanitizer(self):
+        # Same channel as model_id/title/description (Item 1): the tag is written by the
+        # Hub, so it must not be able to carry invisible characters into the envelope.
+        p = load_probe()
+        models = [{"modelId": "o/n", "downloads": 1,
+                   "pipeline_tag": "text\u200b-generation\u202e\x07"}]
+        item = p.hf_search(["x"], 5, fetch=lambda url, **kw: models)[0]
+        self.assertEqual(item["pipeline_tag"], "text-generation")
 
     def test_query_url_is_the_keyless_hub_endpoint_sorted_by_downloads(self):
         p = load_probe()

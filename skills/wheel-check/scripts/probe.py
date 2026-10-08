@@ -566,7 +566,7 @@ def _hf_url(terms, limit):
             + "&limit=%d&sort=downloads&direction=-1" % _per_page(limit))
 
 def _hf_entry(model):
-    """One Hub model -> a `model` entry (§4.3): model_id / downloads / likes / url only.
+    """One Hub model -> a `model` entry (§4.3): model_id / pipeline_tag / downloads / likes / url.
 
     Models are not code libraries (§5.5), so no repo-shaped field is borrowed here: doing
     so would present Hub downloads as repository maturity, the confusion §9 warns about.
@@ -574,13 +574,21 @@ def _hf_entry(model):
     "huggingface.co/None" a straight string format would hand the caller, the same rule
     `_hn_entry` already follows for a hit without an objectID.
 
-    `model_id` is third-party text and goes through `sanitize_text` (`title`/`description`
-    precedent). The URL is derived from the SANITIZED id on purpose: a link that disagreed
-    with the id rendered next to it would be a link the caller cannot check.
+    `pipeline_tag` (Item 5) is the Hub's own label for what the model DOES —
+    `automatic-speech-recognition`, `text-generation` — so a candidate becomes decidable by
+    use rather than by download count, which is the number §9 warns against reading as
+    maturity. It is reported as the Hub wrote it, and `None` when the body has none (or has
+    a non-string there), never `""`.
+
+    `model_id` and `pipeline_tag` are third-party text and go through `sanitize_text`
+    (`title`/`description` precedent). The URL is derived from the SANITIZED id on purpose:
+    a link that disagreed with the id rendered next to it would be a link the caller cannot
+    check.
     """
     model_id = sanitize_text(model.get("modelId") or model.get("id"))
     return {"kind": "model",
             "model_id": model_id,
+            "pipeline_tag": sanitize_text(model.get("pipeline_tag")),
             "downloads": model.get("downloads"),
             "likes": model.get("likes"),
             "url": (HF_MODEL % model_id) if model_id else None}

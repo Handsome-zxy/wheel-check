@@ -189,7 +189,8 @@ probe.py package --registry npm --name chokidar   # 精确包名查询（非关�
       "url": "https://news.ycombinator.com/item?id=...", "points": 42,
       "created_at": "2026-03-11", "external_url": "https://github.com/..." },
     { "kind": "model",
-      "model_id": "openai/whisper-large-v3", "downloads": 2400000, "likes": 4100,
+      "model_id": "openai/whisper-large-v3", "pipeline_tag": "automatic-speech-recognition",
+      "downloads": 2400000, "likes": 4100,
       "url": "https://huggingface.co/openai/whisper-large-v3" }
   ]
 }
