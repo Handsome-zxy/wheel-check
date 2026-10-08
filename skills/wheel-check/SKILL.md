@@ -112,4 +112,4 @@ description: Use when the user is about to build something new — a project, re
 | `references/triage-rubric.md` | 判定候选算不算"真正解决同一问题"、确认证据字段、遇到 HN/HF 条目时 |
 | `references/query-patterns.md` | 提炼检索词、中文转英文、需要重试或降过滤时 |
 | `references/verdicts.md` | 要写最终回话时（**四种**终态 A / A2 / B / C 的模板与 a/b 措辞） |
-| `references/reuse-map.md` | 需要说明本 skill 的判定与措辞来源时 |
+| `docs/reuse-map.md`（**仓库内文件，不在 skill 载荷里**） | 需要说明本 skill 的判定与措辞来源时 |

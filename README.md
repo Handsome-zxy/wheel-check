@@ -8,7 +8,9 @@
 - 行为证据：[`evals/`](evals/) （`cases.jsonl` 10 条用例 + RED/GREEN 记录）
 - 实现与 spec 的偏差：[`docs/wheel-check-design.md` §13 实现偏差记录](docs/wheel-check-design.md)
 - 决策记录（每条裁决的理由与"判断错了要付什么代价"）：[`docs/rulings.md`](docs/rulings.md)
+- 借鉴映射（判定与措辞的设计来源，不进 skill 载荷）：[`docs/reuse-map.md`](docs/reuse-map.md)
 - 许可：MIT · 2026
+- **出网声明 / Network use：** 检索时只把本次提炼出的**英文检索词**发给 GitHub、Hacker News、Hugging Face 三个公开端点（来源见 §3、§7）；不发别的内容、不写任何文件、不采集遥测。只有 `GITHUB_TOKEN` 会作为请求头发给 `api.github.com`，且不跟随跨主机跳转（详见 §6）。
 
 ---
 
@@ -93,10 +95,12 @@ python <skills>/wheel-check/scripts/probe.py search --terms "markdown viewer" --
 - **只发给 `api.github.com`**：Hacker News（Algolia）与 Hugging Face Hub 是无密钥第三方，不会收到这个凭据。
 - **脚本从不打印、不回显 token**：stdout 是纯 JSON，诊断只走 stderr，两处都不含 token（有回归测试盯着）。
 - 设置方式：POSIX `export GITHUB_TOKEN=...`；PowerShell `$env:GITHUB_TOKEN = "..."`；或在宿主的进程环境里持久化。
+- **最小权限**：公开搜索**不需要任何 scope**（GitHub 的 search API 对匿名与低权限 token 一视同仁，token 只是把 10 次/分钟提到 30 次/分钟）。所以请用一个**不带任何 scope 的只读 token**（fine-grained PAT 只勾 Public Repositories 的只读权限即可），**不要复用带写权限的 PAT**——本工具只需要发 GET。
 - token 无效 / 过期时，GitHub 回 401，脚本报 `degraded`（`reason: null`，原始状态码在 stderr）——它**不会**悄悄退回匿名，也不会假装查到了空结果。
+- token 只发给 `api.github.com`，并且**不跟随跨主机跳转**：重定向到别的 host 时 `Authorization` 会被丢弃（同主机内跳转则保留）。
 - 一次 `probe.py search` 调用的请求预算：≤3 个过滤档位（每档 1 次请求）+ 最多 1 次 403/429 重试 = **最多 4 次 GitHub 请求**，命中即停（通常 1–2 次）。未认证 10 次/分钟 ≈ 2 次完整调用/分钟；设了 `GITHUB_TOKEN` 是 30 次/分钟。
 
-隐私：不采集遥测；脚本本身不写任何文件，只向上面三个公开端点发出你这次检索所需的请求。
+隐私：不采集遥测；脚本本身不写任何文件（无状态文件、无缓存、无日志——"写入 0 个文件"包括不记跨进程重试计数），只把本次提炼出的英文检索词发给上面三个公开端点。**这就是全部出网内容。**
 
 ### 7. 调用方式与输出契约
 
@@ -115,7 +119,7 @@ python <path>/probe.py repo <owner/name>             # 单个仓库的硬事实�
 
 ```json
 { "status": "ok | degraded",
-  "reason": "rate-limited | timeout | network | bad-args | null",
+  "reason": "rate-limited | timeout | network | null",
   "sources": [{ "source": "github", "tier": "strict|relaxed|plain|none", "total": 11, "status": "ok" }],
   "results": [{ "kind": "repo", "full_name": "Tinder/bazel-diff", "url": "https://github.com/Tinder/bazel-diff",
                 "stars": 526, "pushed_at": "2026-10-06", "license": "Apache-2.0", "archived": false,
@@ -127,7 +131,7 @@ python <path>/probe.py repo <owner/name>             # 单个仓库的硬事实�
 
 ### 8. 已知限制（诚实清单）
 
-1. **重试退避只有 1.0 秒，而 GitHub 的搜索窗口是 60 秒。** 真遇到配额耗尽时，这一次重试基本只是再确认一遍 403，还多花掉 1 次/分钟的配额。真正管用的补救是设置 `GITHUB_TOKEN`，不是重试。（数值来自 §6，属 brief 指定值。）
+1. **重试不再固定睡 1.0 秒。** 403/429 带着 `X-RateLimit-Reset`，脚本据此决定：reset 在 45 秒预算内就等到窗口重开再重试一次；**更远就根本不重试**——信封直接 `degraded` / `rate-limited`（只花 1 次请求而不是 2 次），stderr 写明 reset 时刻。响应里读不到 reset 时，仍退回固定的 1.0 秒。真正管用的补救始终是设置 `GITHUB_TOKEN`。
 2. **非传输类的 5xx 会显示成 `timeout`。** 504 确实是超时；500 也归到 `timeout`——`reason` 词汇表里没有 `server-error`，加它属于改 spec。行为一致，只是措辞不够精确。
 3. **`limit` 的两条路径刻意不对称：** 程序化调用 `github_search()` / `hn_search()` / `hf_search()` 时，超范围的 `limit` 会被静默夹到 1..100；命令行 `--limit` 超范围则直接以退出码 3 拒绝（那是"调用错误"，不是"检索失败"）。
 4. **含义不明的 API 响应体会降级，而不是被读成"没有结果"。** 200 但 body 是 `{}` 或只有 `message` 时，脚本报 `degraded`（`reason: null`）并在 stderr 给出原因；真正的 `{"total_count": 0, "items": []}` 仍然是 `ok` + `results: []`。三个源都走这条检查：HN 返回的 `{}` 同样降级，`health` 与检索器用的是同一个形状检查。
@@ -141,13 +145,15 @@ python <path>/probe.py repo <owner/name>             # 单个仓库的硬事实�
 ### 9. 测试与行为证据
 
 ```bash
-python -m unittest discover -s tests -t .        # 173 tests, 0 skipped
+python -m unittest discover -s tests -t .        # 208 tests, 0 failures, 0 skipped
 
 # 屏蔽所有 socket 后重跑同一套用例（须先 import ssl / unittest.mock：ssl 导入时要用到 socket 类）
 python -c "import ssl, unittest.mock, socket, unittest, sys; socket.socket=socket.create_connection=socket.getaddrinfo=lambda *a, **k: (_ for _ in ()).throw(OSError('blocked')); sys.exit(0 if unittest.TextTestRunner().run(unittest.TestLoader().discover('tests', top_level_dir='.')).wasSuccessful() else 1)"
 ```
 
-- 测试全部注入假 `fetch`，不碰真实 API；上面第二条命令在全网不可达的条件下同样全绿——即"测试不会偷偷联网"是被验证过的，不是被假设的。（约定：任何测试都不得命中 `api.github.com`，未认证配额只有 10 次/分钟。）
+- 测试全部注入假 `fetch`，不碰真实 API；上面第二条命令在全网不可达的条件下同样全绿（208 tests, OK, skipped=3）——即"测试不会偷偷联网"是被验证过的，不是被假设的。（约定：任何测试都不得命中 `api.github.com`，未认证配额只有 10 次/分钟。）
+- 唯一的例外是**回环地址**：item 6(b) 的跨主机重定向守卫用两个 `127.0.0.1` 上的临时 HTTP 服务器做真实验证（第二个 host 必须收不到 `Authorization`）。它们不是外部 API；socket 被屏蔽时这 3 条用例 **skip**，其余全跑。
+- 需要真实 HTTP 传输的用例都走显式缝隙：凭据类请求注入 `probe._open`，非凭据类注入 `urllib.request.urlopen`。
 - 本机只在 **Python 3.13.3** 上实跑过（Windows PowerShell 5.1 环境）；spec §5.2 声明的最低版本是 3.8，本机没有 3.8 解释器可验，这条差异已记录在案。
 - 行为证据（用例 → 预期 → 观测）在 [`evals/`](evals/)：`cases.jsonl` 是用例集，`results-RED.md` 是基线，`results-GREEN.md` 是 skill 就位后的实测记录（含未覆盖的缺口）。
 - 决策记录（每条裁决的理由与代价）：[`docs/rulings.md`](docs/rulings.md)。原始会话台账 `.superpowers/sdd/wheel-check/progress.md` 是本次构建的草稿纸，**不入库**；结论已全部提炼进 `docs/rulings.md`。
@@ -165,6 +171,8 @@ MIT，见 [`LICENSE`](LICENSE)（2026）。
 When the user is about to **build something new** — a project, repo, skill, plugin, subsystem or tool — and no code has been written yet, `wheel-check` runs one real search and then says exactly one of three things: **there is a real precedent** (a five-field list, evidence, and an a/b question), **there genuinely is none** (one line, then straight back to the original task), or **the search did not work** (speak up, name the source that failed).
 
 The division of labour is deliberate: **the script guarantees the numbers are real, the model guarantees the judgement is sound.** `probe.py` returns hard facts only (stars, last push, license, archived, links) plus the filter tier it used — it never ranks, scores or judges relevance. "Is this actually the same problem?" is the model's call, per `references/triage-rubric.md`.
+
+**Network use:** a search sends the derived **English search terms** to GitHub, Hacker News and the Hugging Face Hub — three public endpoints, nothing else. Nothing is written to disk and no telemetry is collected; only `GITHUB_TOKEN` travels as a header, only to `api.github.com`, and it is dropped if a redirect leaves that host (see §6).
 
 ### 2. What it solves: four differences from comparable tools
 
@@ -239,10 +247,12 @@ python <skills>/wheel-check/scripts/probe.py search --terms "markdown viewer" --
 - **Sent to `api.github.com` only**: Hacker News (Algolia) and the Hugging Face Hub are keyless third parties and never receive the credential.
 - **The token is never printed or echoed**: stdout is pure JSON, diagnostics go to stderr, and neither contains it (regression-tested).
 - How to set it: `export GITHUB_TOKEN=...` (POSIX) or `$env:GITHUB_TOKEN = "..."` (PowerShell), or persist it in the host's process environment.
+- **Least privilege:** public search needs **no scopes at all** (GitHub's search API treats anonymous and low-privilege tokens the same; a token only raises 10 to 30 requests/minute). Use a **scope-less, read-only token** — for a fine-grained PAT, public repositories with read-only access is enough — and **do not reuse a PAT that carries write permissions**. This tool only ever issues GET requests.
 - An invalid or expired token makes GitHub answer 401, which surfaces as `degraded` (`reason: null`, raw status on stderr). It does **not** silently fall back to anonymous, and it never pretends an empty result.
+- The token is sent to `api.github.com` only and **does not follow a cross-host redirect**: `Authorization` is dropped when a redirect leaves the host (kept for same-host redirects).
 - Request budget for one `probe.py search` invocation: ≤3 filter tiers (one request each) plus at most one 403/429 retry = **at most 4 GitHub requests**, stopping at the first tier that hits (typically 1–2). Unauthenticated, 10 requests/minute is ≈2 full invocations per minute; with `GITHUB_TOKEN` it is 30 requests/minute.
 
-Privacy: no telemetry; the script itself writes no files and only sends the requests this search needs to the three public endpoints above.
+Privacy: no telemetry; the script writes no files at all — no state file, no cache, no log (and deliberately no cross-process retry counter) — and sends only this search's derived English search terms to the three public endpoints above. **That is the whole of its network traffic.**
 
 ### 7. Invocation and output contract
 
@@ -262,7 +272,7 @@ python <path>/probe.py repo <owner/name>             # hard facts for one repo (
 
 ### 8. Known limitations (an honest list)
 
-1. **The retry backoff is 1.0 s against GitHub's 60 s search window.** On genuine quota exhaustion the retry mostly re-confirms the 403 while spending one more of the 10 requests/minute. The remedy that works is `GITHUB_TOKEN`, not the retry.
+1. **The retry no longer sleeps a fixed 1.0 s.** A 403/429 carries `X-RateLimit-Reset`, and the script decides from it: a reset inside the 45 s budget is waited out and retried once; a reset further away is **not retried at all** — the envelope comes back `degraded` / `rate-limited` for one request instead of two, and stderr names the reset. With no readable reset the fixed 1.0 s stands. The remedy that works remains `GITHUB_TOKEN`.
 2. **A non-transport 5xx surfaces as `timeout`.** A 504 genuinely is one; a 500 also reports `timeout`, because the `reason` vocabulary has no `server-error` value and adding one would change the spec. Same behaviour, imprecise wording.
 3. **`limit` behaves asymmetrically on purpose:** programmatic calls to `github_search()` / `hn_search()` / `hf_search()` silently clamp out-of-range limits to 1..100, while the CLI's `--limit` rejects them with exit 3 (that is a malformed *call*, not a failed *search*).
 4. **An ambiguous API body degrades instead of being read as "no results".** A 200 whose body is `{}` or only a `message` reports `degraded` (`reason: null`) with the cause on stderr; a genuine `{"total_count": 0, "items": []}` stays `ok` + `results: []`. All three sources run that check: HN's `{}` degrades too, and `health` and the retriever share the same shape check.
@@ -276,13 +286,15 @@ python <path>/probe.py repo <owner/name>             # hard facts for one repo (
 ### 9. Tests and behavioural evidence
 
 ```bash
-python -m unittest discover -s tests -t .        # 173 tests, 0 skipped
+python -m unittest discover -s tests -t .        # 208 tests, 0 failures, 0 skipped
 
 # The same suite with every socket blocked (import ssl/unittest.mock first: ssl needs the socket class)
 python -c "import ssl, unittest.mock, socket, unittest, sys; socket.socket=socket.create_connection=socket.getaddrinfo=lambda *a, **k: (_ for _ in ()).throw(OSError('blocked')); sys.exit(0 if unittest.TextTestRunner().run(unittest.TestLoader().discover('tests', top_level_dir='.')).wasSuccessful() else 1)"
 ```
 
-- Every test injects a fake `fetch` and none of them touches a live API; the second command above stays green with the whole network unreachable, so "the suite never phones home" is verified rather than assumed. (House rule: no test may hit `api.github.com` — the unauthenticated quota is 10 requests/minute.)
+- Every test injects a fake `fetch` and none of them touches a live API; the second command above stays green with the whole network unreachable (208 tests, OK, skipped=3), so "the suite never phones home" is verified rather than assumed. (House rule: no test may hit `api.github.com` — the unauthenticated quota is 10 requests/minute.)
+- The one exception is **loopback**: item 6(b)'s cross-host redirect guard is proved with two real HTTP servers on `127.0.0.1` (the second host must receive **no** `Authorization` header). They are not an external API, and with sockets blocked those 3 tests skip while everything else runs.
+- Credential-bearing requests are intercepted at `probe._open`; requests without a credential at `urllib.request.urlopen`.
 - The suite has only ever been run on **Python 3.13.3** (Windows PowerShell 5.1). spec §5.2 declares a 3.8 floor; no 3.8 interpreter was available here, so that claim remains unverified and is recorded as such.
 - Behavioural evidence (case → expectation → observation) lives in [`evals/`](evals/): `cases.jsonl` is the case set, `results-RED.md` the baseline, `results-GREEN.md` the observed runs with the gaps left visible.
 - The ruling record (every decision, its one-line rationale and its cost-if-wrong): [`docs/rulings.md`](docs/rulings.md). The raw session ledger `.superpowers/sdd/wheel-check/progress.md` is this build's scratch pad and is **not committed**; every conclusion was distilled into `docs/rulings.md`.
