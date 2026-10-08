@@ -40,7 +40,7 @@
 | **L3** | 宿主 `web_search` / `web_fetch` 查网页 | L1、L2 都不可用 | **不可信——star / 日期必须标"未核实"** |
 
 - 能用 L1 就用 L1，否则退 L2，再否则退 L3；**任何一次降级都要写在用户看得到的地方**，绝不静默降级。
-- 预算：一次"新建"最多 **3 次 `probe.py search` 调用**、总耗时目标 ≤45 秒（单位是**调用次数**，不是请求数）。每次调用最多 4 次 GitHub 请求（3 个档位 + 最多 1 次重试），通常 1–2 次；未认证 10 次/分钟 ≈ 2 次完整调用/分钟。**45 秒是"等待 + 检索"的时间预算，不是硬墙**：单次调用的硬上限 = 4 次请求 × 15 秒超时 + 1 次 ≤45 秒的限流等待 = **105 秒**（典型限流路径 ≈75 秒，因为 403 很快就返回）。到 45 秒还没结果就把结论标"未查全"，**绝不**因为超预算就说"没有先例"。
+- 预算：一次"新建"最多 **3 次 `probe.py search` 调用**、总耗时目标 ≤45 秒（单位是**调用次数**，不是请求数）。每次调用最多 4 次 GitHub 请求（3 个档位 + 最多 1 次重试），通常 1–2 次；未认证 10 次/分钟 ≈ 2 次完整调用/分钟。**45 秒是"等待 + 检索"的时间预算，不是硬墙**：GitHub 那一段的硬上限 = 4 次请求 × 15 秒超时 + 1 次 ≤45 秒的限流等待 = **105 秒**（典型限流路径 ≈75 秒，因为 403 很快就返回）；一次 `auto` 调用若冷启动 HN 与 HF 两个补充源，请求数可到 6 次，整次调用的真实最坏情况是 **135 秒**。到 45 秒还没结果就把结论标"未查全"，**绝不**因为超预算就说"没有先例"。
 
 ### 4. 行为契约：什么时候出声、什么时候闭嘴
 
@@ -192,7 +192,7 @@ The problem: nothing forces an agent to check whether someone has already solved
 | **L3** | The host's `web_search` / `web_fetch` on web pages | L1 and L2 both unavailable | **NOT trustworthy — every star count and date must be labelled unverified** |
 
 - Prefer L1, fall back to L2, then L3; **every degradation is stated where the user can see it** — never silent.
-- Budget: at most **3 `probe.py search` invocations** and a ~45-second time target per "new build" (the unit is invocations, not requests). Each invocation spends at most 4 GitHub requests (3 tiers + at most one retry), typically 1–2, because the tier ladder stops at the first tier that returns hits; unauthenticated, 10 requests/minute is ≈2 full invocations per minute. **45 seconds is the wait-plus-search budget, not a hard wall:** the hard ceiling for one invocation is 4 requests × 15 s timeout + one ≤45 s rate-limit wait = **105 s** (the typical rate-limit path is ≈75 s, because a 403 returns quickly). Past 45 seconds, label the answer incomplete — never turn it into "there is no precedent".
+- Budget: at most **3 `probe.py search` invocations** and a ~45-second time target per "new build" (the unit is invocations, not requests). Each invocation spends at most 4 GitHub requests (3 tiers + at most one retry), typically 1–2, because the tier ladder stops at the first tier that returns hits; unauthenticated, 10 requests/minute is ≈2 full invocations per minute. **45 seconds is the wait-plus-search budget, not a hard wall:** the GitHub leg's ceiling is 4 requests × 15 s timeout + one ≤45 s rate-limit wait = **105 s** (the typical rate-limit path is ≈75 s, because a 403 returns quickly); with the HN and HF legs cold-started, one `auto` invocation can send 6 requests, whose true worst case is **135 s**. Past 45 seconds, label the answer incomplete — never turn it into "there is no precedent".
 
 ### 4. The behaviour contract: when to speak, when to stay quiet
 
@@ -272,7 +272,7 @@ python <path>/probe.py repo <owner/name>             # hard facts for one repo (
 
 ### 8. Known limitations (an honest list)
 
-1. **The retry no longer sleeps a fixed 1.0 s.** A 403/429 carries `X-RateLimit-Reset`, and the script decides from it: a reset inside the 45 s budget is waited out and retried once; a reset further away is **not retried at all** — the envelope comes back `degraded` / `rate-limited` for one request instead of two, and stderr names the reset. With no readable reset the fixed 1.0 s stands. **That wait is real**, and it counts against the wall clock (see the 105 s hard ceiling above), so a rate-limited invocation can outlast the "45-second budget" phrasing. The remedy that works remains `GITHUB_TOKEN`.
+1. **The retry no longer sleeps a fixed 1.0 s.** A 403/429 carries `X-RateLimit-Reset`, and the script decides from it: a reset inside the 45 s budget is waited out and retried once; a reset further away is **not retried at all** — the envelope comes back `degraded` / `rate-limited` for one request instead of two, and stderr names the reset. With no readable reset the fixed 1.0 s stands. **That wait is real**, and it counts against the wall clock (see the 105 s GitHub-leg ceiling above; a cold-start `auto` invocation that also queries HN and HF can reach 135 s), so a rate-limited invocation can outlast the "45-second budget" phrasing. The remedy that works remains `GITHUB_TOKEN`.
 2. **A non-transport 5xx surfaces as `timeout`.** A 504 genuinely is one; a 500 also reports `timeout`, because the `reason` vocabulary has no `server-error` value and adding one would change the spec. Same behaviour, imprecise wording.
 3. **`limit` behaves asymmetrically on purpose:** programmatic calls to `github_search()` / `hn_search()` / `hf_search()` silently clamp out-of-range limits to 1..100, while the CLI's `--limit` rejects them with exit 3 (that is a malformed *call*, not a failed *search*).
 4. **An ambiguous API body degrades instead of being read as "no results".** A 200 whose body is `{}` or only a `message` reports `degraded` (`reason: null`) with the cause on stderr; a genuine `{"total_count": 0, "items": []}` stays `ok` + `results: []`. All three sources run that check: HN's `{}` degrades too, and `health` and the retriever share the same shape check.

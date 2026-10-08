@@ -25,13 +25,16 @@ SEARCH_BUDGET_SECONDS = 45.0   # §4.2's whole-invocation time budget, and there
                                # search window is 60s, so a reset further out than this is
                                # not worth a second request (Item 6a)
 REQUEST_TIMEOUT = 15           # seconds allowed per HTTP request (urlopen_json's default)
-INVOCATION_REQUEST_CEILING = 4 # 3 filter tiers + 1 retry: the most one `search` invocation
-                               # ever sends. The budget above caps the WAIT, not elapsed time,
-                               # so the documented hard ceiling for one invocation is
+INVOCATION_REQUEST_CEILING = 4 # 3 filter tiers + 1 retry: the most GITHUB requests one `search`
+                               # invocation ever sends. The budget above caps the WAIT, not elapsed
+                               # time, so the documented hard ceiling for the GitHub leg is
                                # 4 * 15 + 45 = 105s (the typical rate-limit path is
-                               # 1 request + <=45s wait + 1 retry = ~75s), and
+                               # 1 request + <=45s wait + 1 retry = ~75s). An `auto` invocation can
+                               # also cold-start the HN and HF legs, i.e. 6 requests in total, whose
+                               # true worst case is 6 * 15 + 45 = 135s — that is the whole-invocation
+                               # bound and it is stated as such wherever the budget is documented.
                                # `test_the_worst_case_wall_clock_is_the_documented_105_seconds`
-                               # is what keeps this comment and the docs honest.
+                               # keeps this comment and the docs honest about the GitHub leg.
 
 UA = {"User-Agent": "wheel-check", "Accept": "application/vnd.github+json"}
 
