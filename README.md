@@ -40,7 +40,7 @@
 | **L3** | 宿主 `web_search` / `web_fetch` 查网页 | L1、L2 都不可用 | **不可信——star / 日期必须标"未核实"** |
 
 - 能用 L1 就用 L1，否则退 L2，再否则退 L3；**任何一次降级都要写在用户看得到的地方**，绝不静默降级。
-- 预算：一次"新建"最多 **3 次 `probe.py search` 调用**、总耗时 ≤45 秒（单位是**调用次数**，不是请求数）。每次调用最多 4 次 GitHub 请求（3 个档位 + 最多 1 次重试），通常 1–2 次；未认证 10 次/分钟 ≈ 2 次完整调用/分钟。预算耗尽的结论要标"未查全"，**绝不**因为超预算就说"没有先例"。
+- 预算：一次"新建"最多 **3 次 `probe.py search` 调用**、总耗时目标 ≤45 秒（单位是**调用次数**，不是请求数）。每次调用最多 4 次 GitHub 请求（3 个档位 + 最多 1 次重试），通常 1–2 次；未认证 10 次/分钟 ≈ 2 次完整调用/分钟。**45 秒是"等待 + 检索"的时间预算，不是硬墙**：单次调用的硬上限 = 4 次请求 × 15 秒超时 + 1 次 ≤45 秒的限流等待 = **105 秒**（典型限流路径 ≈75 秒，因为 403 很快就返回）。到 45 秒还没结果就把结论标"未查全"，**绝不**因为超预算就说"没有先例"。
 
 ### 4. 行为契约：什么时候出声、什么时候闭嘴
 
@@ -131,7 +131,7 @@ python <path>/probe.py repo <owner/name>             # 单个仓库的硬事实�
 
 ### 8. 已知限制（诚实清单）
 
-1. **重试不再固定睡 1.0 秒。** 403/429 带着 `X-RateLimit-Reset`，脚本据此决定：reset 在 45 秒预算内就等到窗口重开再重试一次；**更远就根本不重试**——信封直接 `degraded` / `rate-limited`（只花 1 次请求而不是 2 次），stderr 写明 reset 时刻。响应里读不到 reset 时，仍退回固定的 1.0 秒。真正管用的补救始终是设置 `GITHUB_TOKEN`。
+1. **重试不再固定睡 1.0 秒。** 403/429 带着 `X-RateLimit-Reset`，脚本据此决定：reset 在 45 秒预算内就等到窗口重开再重试一次；**更远就根本不重试**——信封直接 `degraded` / `rate-limited`（只花 1 次请求而不是 2 次），stderr 写明 reset 时刻。响应里读不到 reset 时，仍退回固定的 1.0 秒。**那次等待是真等**：它计入墙钟（见上面的硬上限 105 秒），最坏情况下调用会比"45 秒预算"这句话听起来更久。真正管用的补救始终是设置 `GITHUB_TOKEN`。
 2. **非传输类的 5xx 会显示成 `timeout`。** 504 确实是超时；500 也归到 `timeout`——`reason` 词汇表里没有 `server-error`，加它属于改 spec。行为一致，只是措辞不够精确。
 3. **`limit` 的两条路径刻意不对称：** 程序化调用 `github_search()` / `hn_search()` / `hf_search()` 时，超范围的 `limit` 会被静默夹到 1..100；命令行 `--limit` 超范围则直接以退出码 3 拒绝（那是"调用错误"，不是"检索失败"）。
 4. **含义不明的 API 响应体会降级，而不是被读成"没有结果"。** 200 但 body 是 `{}` 或只有 `message` 时，脚本报 `degraded`（`reason: null`）并在 stderr 给出原因；真正的 `{"total_count": 0, "items": []}` 仍然是 `ok` + `results: []`。三个源都走这条检查：HN 返回的 `{}` 同样降级，`health` 与检索器用的是同一个形状检查。
@@ -145,7 +145,7 @@ python <path>/probe.py repo <owner/name>             # 单个仓库的硬事实�
 ### 9. 测试与行为证据
 
 ```bash
-python -m unittest discover -s tests -t .        # 208 tests, 0 failures, 0 skipped
+python -m unittest discover -s tests -t .        # 213 tests, 0 failures, 0 skipped
 
 # 屏蔽所有 socket 后重跑同一套用例（须先 import ssl / unittest.mock：ssl 导入时要用到 socket 类）
 python -c "import ssl, unittest.mock, socket, unittest, sys; socket.socket=socket.create_connection=socket.getaddrinfo=lambda *a, **k: (_ for _ in ()).throw(OSError('blocked')); sys.exit(0 if unittest.TextTestRunner().run(unittest.TestLoader().discover('tests', top_level_dir='.')).wasSuccessful() else 1)"
@@ -192,7 +192,7 @@ The problem: nothing forces an agent to check whether someone has already solved
 | **L3** | The host's `web_search` / `web_fetch` on web pages | L1 and L2 both unavailable | **NOT trustworthy — every star count and date must be labelled unverified** |
 
 - Prefer L1, fall back to L2, then L3; **every degradation is stated where the user can see it** — never silent.
-- Budget: at most **3 `probe.py search` invocations** and ~45 seconds per "new build" (the unit is invocations, not requests). Each invocation spends at most 4 GitHub requests (3 tiers + at most one retry), typically 1–2, because the tier ladder stops at the first tier that returns hits; unauthenticated, 10 requests/minute is ≈2 full invocations per minute. A budget-exhausted answer must be labelled incomplete — never turned into "there is no precedent".
+- Budget: at most **3 `probe.py search` invocations** and a ~45-second time target per "new build" (the unit is invocations, not requests). Each invocation spends at most 4 GitHub requests (3 tiers + at most one retry), typically 1–2, because the tier ladder stops at the first tier that returns hits; unauthenticated, 10 requests/minute is ≈2 full invocations per minute. **45 seconds is the wait-plus-search budget, not a hard wall:** the hard ceiling for one invocation is 4 requests × 15 s timeout + one ≤45 s rate-limit wait = **105 s** (the typical rate-limit path is ≈75 s, because a 403 returns quickly). Past 45 seconds, label the answer incomplete — never turn it into "there is no precedent".
 
 ### 4. The behaviour contract: when to speak, when to stay quiet
 
@@ -272,7 +272,7 @@ python <path>/probe.py repo <owner/name>             # hard facts for one repo (
 
 ### 8. Known limitations (an honest list)
 
-1. **The retry no longer sleeps a fixed 1.0 s.** A 403/429 carries `X-RateLimit-Reset`, and the script decides from it: a reset inside the 45 s budget is waited out and retried once; a reset further away is **not retried at all** — the envelope comes back `degraded` / `rate-limited` for one request instead of two, and stderr names the reset. With no readable reset the fixed 1.0 s stands. The remedy that works remains `GITHUB_TOKEN`.
+1. **The retry no longer sleeps a fixed 1.0 s.** A 403/429 carries `X-RateLimit-Reset`, and the script decides from it: a reset inside the 45 s budget is waited out and retried once; a reset further away is **not retried at all** — the envelope comes back `degraded` / `rate-limited` for one request instead of two, and stderr names the reset. With no readable reset the fixed 1.0 s stands. **That wait is real**, and it counts against the wall clock (see the 105 s hard ceiling above), so a rate-limited invocation can outlast the "45-second budget" phrasing. The remedy that works remains `GITHUB_TOKEN`.
 2. **A non-transport 5xx surfaces as `timeout`.** A 504 genuinely is one; a 500 also reports `timeout`, because the `reason` vocabulary has no `server-error` value and adding one would change the spec. Same behaviour, imprecise wording.
 3. **`limit` behaves asymmetrically on purpose:** programmatic calls to `github_search()` / `hn_search()` / `hf_search()` silently clamp out-of-range limits to 1..100, while the CLI's `--limit` rejects them with exit 3 (that is a malformed *call*, not a failed *search*).
 4. **An ambiguous API body degrades instead of being read as "no results".** A 200 whose body is `{}` or only a `message` reports `degraded` (`reason: null`) with the cause on stderr; a genuine `{"total_count": 0, "items": []}` stays `ok` + `results: []`. All three sources run that check: HN's `{}` degrades too, and `health` and the retriever share the same shape check.
@@ -286,13 +286,13 @@ python <path>/probe.py repo <owner/name>             # hard facts for one repo (
 ### 9. Tests and behavioural evidence
 
 ```bash
-python -m unittest discover -s tests -t .        # 208 tests, 0 failures, 0 skipped
+python -m unittest discover -s tests -t .        # 213 tests, 0 failures, 0 skipped
 
 # The same suite with every socket blocked (import ssl/unittest.mock first: ssl needs the socket class)
 python -c "import ssl, unittest.mock, socket, unittest, sys; socket.socket=socket.create_connection=socket.getaddrinfo=lambda *a, **k: (_ for _ in ()).throw(OSError('blocked')); sys.exit(0 if unittest.TextTestRunner().run(unittest.TestLoader().discover('tests', top_level_dir='.')).wasSuccessful() else 1)"
 ```
 
-- Every test injects a fake `fetch` and none of them touches a live API; the second command above stays green with the whole network unreachable (208 tests, OK, skipped=3), so "the suite never phones home" is verified rather than assumed. (House rule: no test may hit `api.github.com` — the unauthenticated quota is 10 requests/minute.)
+- Every test injects a fake `fetch` and none of them touches a live API; the second command above stays green with the whole network unreachable (213 tests, OK, skipped=3), so "the suite never phones home" is verified rather than assumed. (House rule: no test may hit `api.github.com` — the unauthenticated quota is 10 requests/minute.)
 - The one exception is **loopback**: item 6(b)'s cross-host redirect guard is proved with two real HTTP servers on `127.0.0.1` (the second host must receive **no** `Authorization` header). They are not an external API, and with sockets blocked those 3 tests skip while everything else runs.
 - Credential-bearing requests are intercepted at `probe._open`; requests without a credential at `urllib.request.urlopen`.
 - The suite has only ever been run on **Python 3.13.3** (Windows PowerShell 5.1). spec §5.2 declares a 3.8 floor; no 3.8 interpreter was available here, so that claim remains unverified and is recorded as such.

@@ -247,7 +247,8 @@ probe.py package --registry npm --name chokidar   # 精确包名查询（非关�
   → ④ GitHub 结果分流
        ├─ 命中且非全噪音 → 语义重排
        └─ 空 / 全噪音 → 重试：**换下一个概念名词（一次只发一个）** → 去 pushed: → 去 stars: → 纯关键词
-                        （≤3 次，≤45s）
+                        （≤3 次 `probe.py search` 调用、≤45s；单次调用的硬上限是
+                          4 次请求 × 15s 超时 + 1 次 ≤45s 的等待 = 105s）
   → ⑤ 仍无 → 追加查询 HN（概念信号源），命中的对口条目用 probe.py repo 补全硬事实
   → ⑥ 判定"是否真正解决同一问题"
        ├─ 有 → 结构化清单 + 询问 a/b ──→ 交回主模型
@@ -301,13 +302,13 @@ probe.py package --registry npm --name chokidar   # 精确包名查询（非关�
 
 | 情况 | 行为 |
 |---|---|
-| 限流 403/429 | 退避重试 1 次 → 仍失败：`degraded / rate-limited`，提示设置 `GITHUB_TOKEN` |
+| 限流 403/429 | 响应带 `X-RateLimit-Reset` 时：reset 在 45s 内 → 等到窗口重开重试 1 次；更远 → **不重试**，直接 `degraded / rate-limited`（stderr 写明 reset 时刻）。读不到 reset 才退回固定 1.0s |
 | 存在 `GITHUB_TOKEN` | 自动使用（10 → 30 次/分钟） |
 | 网络完全不通 | `health` 阶段即发现 → `degraded / network` → 退 L2/L3 |
 | 无 Python 解释器 | 退 L2 → L3，并**明说精度下降**（硬事实不可靠） |
 | 非 ASCII 输出（控制台 GBK） | `sys.stdout.reconfigure(encoding="utf-8")` + `PYTHONIOENCODING=utf-8` |
 | 单请求超时 | 15 秒，计入预算，不重试超过 2 次 |
-| 总预算耗尽 | 用现有证据出结论，标 `degraded`，不出结论性"没有" |
+| 总预算耗尽 | 用现有证据出结论，标 `degraded`，不出结论性"没有"；45 秒是**时间预算（目标）**，单次调用的硬上限是 4 × 15s 超时 + 1 次 ≤45s 限流等待 = **105s** |
 | 参数错误 | 退出码 3，`bad-args`，不静默 |
 
 **降级链**：`probe.py(GitHub API)` → `L2 宿主 HTTP 工具` → `L3 web_search` → 全不可用则 `degraded` 出声。
