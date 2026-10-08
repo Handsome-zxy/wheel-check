@@ -6,6 +6,7 @@ import os
 import socket
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,14 @@ SEARCH_BUDGET_SECONDS = 45.0   # §4.2's whole-invocation time budget, and there
                                # longest wait a rate-limited retry may ever serve: GitHub's
                                # search window is 60s, so a reset further out than this is
                                # not worth a second request (Item 6a)
+REQUEST_TIMEOUT = 15           # seconds allowed per HTTP request (urlopen_json's default)
+INVOCATION_REQUEST_CEILING = 4 # 3 filter tiers + 1 retry: the most one `search` invocation
+                               # ever sends. The budget above caps the WAIT, not elapsed time,
+                               # so the documented hard ceiling for one invocation is
+                               # 4 * 15 + 45 = 105s (the typical rate-limit path is
+                               # 1 request + <=45s wait + 1 retry = ~75s), and
+                               # `test_the_worst_case_wall_clock_is_the_documented_105_seconds`
+                               # is what keeps this comment and the docs honest.
 
 UA = {"User-Agent": "wheel-check", "Accept": "application/vnd.github+json"}
 
@@ -158,7 +167,7 @@ def _open(req, timeout):
         return _guarded_opener().open(req, timeout=timeout)
     return urllib.request.urlopen(req, timeout=timeout)
 
-def urlopen_json(url, headers=None, timeout=15):
+def urlopen_json(url, headers=None, timeout=REQUEST_TIMEOUT):
     """Default `fetch`: one GET, JSON body. Callers may inject their own.
 
     `headers=None` means this file's own headers, which carry `GITHUB_TOKEN` when the
@@ -430,17 +439,32 @@ def build_query(terms, suffix):
 UNTRUSTED_TEXT_MAX = 200        # §4.3: how much third-party free text may reach the envelope
 TRUNCATION_MARK = "\u2026"      # a truncated field must LOOK truncated
 
-# Characters a human reader cannot see but the model still reads. Stripping them is the
-# whole point: a description that reads clean on screen must not smuggle a second text
-# past the person who is supposed to judge the candidate. C0/C1 controls, the zero-width
-# set, the bidi overrides/isolates, and the BOM.
-_INVISIBLE = ((0x00, 0x1F), (0x7F, 0x9F), (0x200B, 0x200F), (0x202A, 0x202E),
-              (0x2066, 0x2069), (0xFEFF, 0xFEFF))
+# What counts as hidden is decided by Unicode's own categories, not by a hand-copied range
+# list (review fix). The first version enumerated ranges and missed 144 code points —
+# including U+061C ARABIC LETTER MARK (itself a bidi control), U+00AD, U+180E, the invisible
+# operators, the interlinear annotation block and the whole deprecated TAG block
+# (U+E0001, U+E0020–U+E007F), which is precisely the shape text-hiding takes. `unicodedata`
+# is stdlib, so the rule is version-proof and 3.8-safe, and a code point the interpreter
+# knows about cannot be forgotten the way a hand-written range can.
+#
+# Two documented exceptions:
+#   * the C0 whitespace controls are SEPARATORS, not glue: "a\nb" must stay two words, so
+#     they become a space before this check (see `sanitize_text`);
+#   * a handful of Cf code points are genuinely VISIBLE (prepended concatenation marks such
+#     as the Arabic number signs). They render a glyph, and removing them would alter text a
+#     reader can see — which this function must never do.
+_VISIBLE_FORMAT = frozenset((
+    0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605,   # Arabic number signs
+    0x06DD, 0x070F, 0x0890, 0x0891, 0x08E2,           # end of ayah, Syriac/Arabic marks
+    0x110BD, 0x110CD,                                 # Kaithi number signs
+))
 _WHITESPACE_CONTROLS = "\t\n\r\v\f"
 
 def _is_invisible(ch):
-    code = ord(ch)
-    return any(lo <= code <= hi for lo, hi in _INVISIBLE)
+    """True for a control/format character a human reader cannot see."""
+    if unicodedata.category(ch) not in ("Cc", "Cf"):
+        return False
+    return ord(ch) not in _VISIBLE_FORMAT
 
 def sanitize_text(value):
     """Third-party free text, made safe to RENDER while staying a faithful quote (§4.3).
@@ -449,11 +473,13 @@ def sanitize_text(value):
     channel by which third-party content reaches the model's decision path. This makes
     three guarantees about what the envelope carries:
 
-    1. **Visible.** C0/C1 controls, zero-width characters and bidi overrides/isolates are
-       dropped. Pairing a benign-looking sentence with invisible text is the cheap way to
-       show the human one thing and the model another; a quote the reader cannot fully see
-       is not evidence. Newlines and tabs become a space so that "a\\nb" stays two words
-       rather than fusing into one.
+    1. **Visible.** Every Cc/Cf character the interpreter knows about is dropped (bidi
+       controls and isolates, zero-width characters, invisible operators, tag characters,
+       the BOM, DEL/C1 …) except the visible prepended concatenation marks listed in
+       `_VISIBLE_FORMAT`. Pairing a benign-looking sentence with invisible text is the cheap
+       way to show the human one thing and the model another; a quote the reader cannot
+       fully see is not evidence. Newlines and tabs become a space so that "a\\nb" stays two
+       words rather than fusing into one.
     2. **Bounded.** At most `UNTRUSTED_TEXT_MAX` characters, and a cut field ends with
        `TRUNCATION_MARK` so it is visibly cut instead of silently amputated.
     3. **Uncensored.** Words are never removed or reworded — an instruction aimed at the
